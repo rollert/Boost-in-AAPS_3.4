@@ -9,6 +9,34 @@
 
 ***Boost and Boost V2 based on AAPS 3.4.2.1***
 
+---
+
+## Custom Modifications from Upstream AAPS 3.4.2.1
+
+This fork contains deliberate divergences from upstream AAPS. The following changes are not present in the official AAPS release and affect loop behaviour.
+
+### TDD Blend Weighting (All DynISF Plugins)
+
+All Dynamic ISF plugins in this fork — standard Dynamic ISF, Boost, and Boost V2 — use an 80/10/10 blend for the TDD (Total Daily Dose) calculation:
+
+```
+TDD = (Weighted 8h average × 0.80) + (7-day average × 0.10) + (1-day average × 0.10)
+```
+
+Upstream AAPS uses 33/34/33. The 80/10/10 weighting makes the ISF calculation significantly more responsive to recent insulin changes (last 8 hours) while reducing the influence of longer-term averages. This is a clinical decision: it improves reaction speed to acute metabolic shifts (illness, exercise, medication changes) at the cost of slightly higher short-term volatility.
+
+⚠️ **Impact:** If you are switching from upstream AAPS or another Boost fork that uses the upstream 33/34/33 blend, your ISF values will change. Expect more aggressive corrections when recent TDD diverges from historical averages. Monitor closely during the first 24–48 hours.
+
+### DST Change Handling
+
+When the device detects a DST (daylight saving time) transition, the upstream DstHelperPlugin suspends the loop for 3 hours (`DISABLE_TIME_FRAME_HOURS = -3`). In this fork, the suspension window is reduced to 1 hour (`DISABLE_TIME_FRAME_HOURS = -1`).
+
+**Rationale:** A 3-hour loop suspension is overly conservative for modern pump/CGM combinations that handle time changes robustly. The 1-hour window still provides a safety margin during the exact transition period while minimising the duration of reduced automated insulin delivery.
+
+⚠️ **Impact:** If you observe unexpected BG excursions immediately after a DST change, verify that your pump's internal clock has updated correctly. The shorter suspension window assumes the pump handles the time change without requiring extended manual intervention.
+
+---
+
 Boost V2 is a variant of the Boost plugin that uses **Chris Wilson's DynISF V2 formula** for ISF calculation.
 
 > ⚠️ **Boost V2 is not ready for live use.** Do not use Boost V2 as your active APS plugin. It should only be run **in parallel** alongside the standard Boost plugin (via Config Builder) on a development or secondary phone so that you can compare its loop outputs and logs against Boost before any consideration of switching. No live dosing decisions should be based on Boost V2 at this stage.
