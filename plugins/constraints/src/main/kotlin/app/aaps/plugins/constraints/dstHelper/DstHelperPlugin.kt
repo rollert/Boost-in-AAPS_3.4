@@ -44,7 +44,7 @@ class DstHelperPlugin @Inject constructor(
 
     companion object {
 
-        private const val DISABLE_TIME_FRAME_HOURS = -3
+        private const val DISABLE_TIME_FRAME_HOURS = -1
         private const val WARN_PRIOR_TIME_FRAME_HOURS = 12
     }
 
