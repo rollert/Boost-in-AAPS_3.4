@@ -309,7 +309,7 @@ class DetermineBasalAdapterSMBDynamicISFJS(private val scriptReader: ScriptReade
         }
 
         val tddWeightedFromLast8H = ((1.4 * tddLast4H) + (0.6 * tddLast8to4H)) * 3
-        var tdd = (tddWeightedFromLast8H * 0.33) + (tdd7D * 0.34) + (tdd1D * 0.33)
+        var tdd = (tddWeightedFromLast8H * 0.80) + (tdd7D * 0.10) + (tdd1D * 0.10)
         val dynISFadjust = preferences.get(IntKey.ApsDynIsfAdjustmentFactor) / 100.0
         tdd *= dynISFadjust
 
