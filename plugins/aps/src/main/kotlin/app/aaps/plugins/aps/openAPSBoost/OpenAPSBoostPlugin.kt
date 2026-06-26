@@ -1323,14 +1323,20 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     // Intraday activity-load SHADOW (2026-06-19): today's cumulative steps vs typical
                     // pace by hour, from the phone pedometer (realtime, free). HC seeds the midnight
                     // baseline ONCE so a mid-day start counts earlier steps. Logged only.
-                    // Re-anchor the phone counter UP to HC whenever HC knows more than the phone has
-                    // counted today (mid-day restart, or phone-not-carried undercount). Upward-only,
-                    // so it never double-counts or goes backwards, and self-heals each HC sync.
-                    val hcToday = healthConnectStepsIngest.todayStepsSoFar
-                    if (hcToday > StepService.getStepsToday(offsetMs)) {
-                        StepService.seedTodayFromHc(hcToday, offsetMs)
-                    }
-                    val stepsToday = StepService.getStepsToday(offsetMs)
+                    // Reconcile with HC's today total — seedTodayFromHc holds the HIGHER of the two,
+                    // never anchors down. Only when HC's value is for the CURRENT local day, so across
+                    // midnight HC's stale yesterday total can't bleed in.
+                    if (healthConnectStepsIngest.todayStepsDay == todayIdx)
+                        StepService.seedTodayFromHc(healthConnectStepsIngest.todayStepsSoFar, offsetMs)
+                    // Source preference: a WORN AAPS Wear watch is the best step source (on-body,
+                    // continuous, independent of Garmin/HC). Use it for today's cumulative when its
+                    // feed is fresh; otherwise fall back to the phone pedometer. Both shadow.
+                    val dayStartMs = todayIdx * 86_400_000L - offsetMs
+                    val wearSc = try { persistenceLayer.getStepsCountFromTimeToTime(dayStartMs, now) } catch (t: Throwable) { emptyList() }
+                    val wearFresh = WearStepSource.isFresh(wearSc, now)
+                    val stepsToday = if (wearFresh) WearStepSource.stepsToday(wearSc, dayStartMs, now)
+                                     else StepService.getStepsToday(offsetMs)
+                    it.boostActivityLoad_stepsSource = if (wearFresh) "wear" else "phone"
                     val intraHour = java.time.LocalTime.now().hour
                     val intra = DailyStepHistoryTracker.intradayFactor(stepsToday, sf.baselineSteps, intraHour)
                     it.boostActivityLoad_stepsToday = stepsToday

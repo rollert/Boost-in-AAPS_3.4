@@ -16,7 +16,6 @@ import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventNewBG
 import app.aaps.core.interfaces.rx.events.EventPreferenceChange
-import app.aaps.core.keys.BooleanKey
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.core.validators.DefaultEditTextValidator
 import app.aaps.core.validators.preferences.AdaptiveIntPreference
@@ -384,14 +383,13 @@ class GarminPlugin @Inject constructor(
     ) {
         aapsLogger.info(LTag.GARMIN, "average heart rate $avg BPM $samplingStart to $samplingEnd")
         if (test) return
-        // 2026-06-03: When Boost Health Connect HR ingest is enabled, suppress the Garmin
-        // Connect IQ side-channel HR write. HC becomes the single source of truth; avoids
-        // duplicate rows at overlapping timestamps. Covers both the URI and IQ-message
-        // entry points which both route through this private sink.
-        if (preferences.get(BooleanKey.ApsBoostHealthConnectHrEnabled)) {
-            aapsLogger.debug(LTag.GARMIN, "HR via Garmin side-channel suppressed (Boost Health Connect HR enabled)")
-            return
-        }
+        // 2026-06-24: The Connect IQ side-channel is the REALTIME HR source — it delivers whenever
+        // the watch is awake and polling glucose, which is most of the day. Previously this was
+        // suppressed when Boost's Health Connect HR ingest was enabled (to avoid duplicate rows),
+        // but that threw away the reliable live feed and left only HC — which goes dark whenever
+        // Garmin Connect is killed by battery optimisation. Now we ALWAYS store the side-channel
+        // HR; Health Connect ingest is demoted to a gap-filler that skips any sample already
+        // covered by a live reading (see HealthConnectHrIngest), so the two no longer duplicate.
         if (avg > 10 && samplingStart > Instant.ofEpochMilli(0L) && samplingEnd > samplingStart) {
             loopHub.storeHeartRate(samplingStart, samplingEnd, avg, device)
         } else if (avg > 0) {

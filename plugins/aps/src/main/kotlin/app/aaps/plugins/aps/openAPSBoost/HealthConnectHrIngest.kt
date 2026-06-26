@@ -64,6 +64,13 @@ class HealthConnectHrIngest @Inject constructor(
     @Volatile private var lastSyncRunMs: Long = 0L
     @Volatile private var permissionWarned = false
 
+    // 2026-06-14: lookback re-sweep window (covers a full night + margin) and an in-memory dedupe
+    // set of already-ingested sample timestamps. Lets each poll re-read the window to catch Garmin's
+    // backdated morning-batch writes without re-persisting samples. Empty on process restart (the
+    // first post-restart poll re-reads the window once; insertOrUpdate is idempotent so it's safe).
+    private val lookbackMs = 18 * 60 * 60_000L
+    private val ingestedSampleMs = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
     val isAvailable: Boolean
         get() = HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE
 
@@ -105,8 +112,9 @@ class HealthConnectHrIngest @Inject constructor(
     }
 
     /**
-     * Read all HeartRateRecord samples since the persisted [LongNonKey.ApsBoostHealthConnectLastSyncMs]
-     * (or the last hour on first run), persist via PersistenceLayer, advance the marker.
+     * Re-sweep the last [lookbackMs] of HeartRateRecord samples each poll, persisting any not yet
+     * ingested this session (deduped via [ingestedSampleMs]). Lookback (NOT forward-only) so Garmin's
+     * backdated overnight morning-batch writes are caught rather than skipped.
      */
     private suspend fun syncOnce(hc: HealthConnectClient, nowMs: Long) {
         // Check permission once and remember the answer for this session
@@ -125,9 +133,14 @@ class HealthConnectHrIngest @Inject constructor(
             return
         }
 
-        val lastSyncedMs = preferences.get(LongNonKey.ApsBoostHealthConnectLastSyncMs)
-        // First run: pull last 60 min so the first ingest doesn't dump 24h of data
-        val sinceMs = if (lastSyncedMs == 0L) nowMs - 60 * 60_000L else lastSyncedMs
+        // 2026-06-14 fix: re-sweep a LOOKBACK WINDOW each poll and dedupe in-memory, instead of
+        // reading forward-only from a persisted high-water mark. Garmin writes overnight HR into
+        // Health Connect as a BACKDATED MORNING BATCH; the old forward-only reader advanced its
+        // marker to "now" on each empty overnight poll, so when the batch landed (timestamps in the
+        // past) it fell before the marker and was permanently skipped — ~0 overnight HR despite HC
+        // holding the data. A lookback re-sweep catches backdated inserts; ingestedSampleMs ensures
+        // each sample is persisted once (insertOrUpdateHeartRate is idempotent regardless).
+        val sinceMs = nowMs - lookbackMs
 
         val request = ReadRecordsRequest(
             recordType = HeartRateRecord::class,
@@ -137,23 +150,29 @@ class HealthConnectHrIngest @Inject constructor(
             )
         )
         val resp = hc.readRecords(request)
-        if (resp.records.isEmpty()) {
-            aapsLogger.debug(LTag.APS, "HealthConnectHrIngest: no new HR records in [${sinceMs}..${nowMs}]")
-            preferences.put(LongNonKey.ApsBoostHealthConnectLastSyncMs, nowMs)
-            return
+        // Gap-filler dedup (2026-06-24): the Garmin Connect IQ side-channel writes realtime HR
+        // whenever the watch is awake. HC must only BACKFILL the gaps it leaves (overnight, or when
+        // the watch wasn't polling) — not duplicate the live feed. Load the HR already in the window
+        // once, bucket existing readings to the minute, and skip any HC sample whose minute already
+        // has a reading. One DB read per poll, then O(1) membership checks.
+        val existingMinutes = HashSet<Long>()
+        try {
+            for (h in persistenceLayer.getHeartRatesFromTimeToTime(sinceMs, nowMs))
+                existingMinutes.add(h.timestamp / 60_000L)
+        } catch (t: Throwable) {
+            aapsLogger.warn(LTag.APS, "HealthConnectHrIngest: could not load existing HR for dedup: ${t.message}")
         }
-
-        var maxSampleMs = sinceMs
-        var inserted = 0
+        var inserted = 0; var skippedCovered = 0
         // HeartRateRecord groups multiple samples per record (a "session" of HR ticks).
-        // Each sample has a time and a beats-per-minute. Convert each into an HR row.
         for (record in resp.records) {
             val device = record.metadata.device?.let { d ->
                 listOfNotNull(d.manufacturer, d.model).joinToString(" ").trim().ifEmpty { "HealthConnect" }
             } ?: "HealthConnect"
             for (sample in record.samples) {
                 val sampleMs = sample.time.toEpochMilli()
-                if (sampleMs <= sinceMs) continue
+                if (sampleMs < sinceMs) continue
+                if (!ingestedSampleMs.add(sampleMs)) continue   // already persisted this session
+                if (sampleMs / 60_000L in existingMinutes) { skippedCovered++; continue }  // live feed already covered this minute
                 val hr = HR(
                     timestamp = sampleMs,
                     duration = 60_000L,                       // HC samples are point-in-time; treat as 1-min weight
@@ -165,11 +184,11 @@ class HealthConnectHrIngest @Inject constructor(
                     { inserted++ },
                     { e -> aapsLogger.warn(LTag.APS, "HealthConnectHrIngest: persist failed: ${e.message}") }
                 )
-                if (sampleMs > maxSampleMs) maxSampleMs = sampleMs
             }
         }
-        preferences.put(LongNonKey.ApsBoostHealthConnectLastSyncMs, maxSampleMs)
-        aapsLogger.info(LTag.APS, "HealthConnectHrIngest: ingested up to ${maxSampleMs} ms (queued $inserted, records ${resp.records.size})")
+        ingestedSampleMs.removeIf { it < sinceMs }   // prune dedupe set to the lookback window
+        preferences.put(LongNonKey.ApsBoostHealthConnectLastSyncMs, nowMs)   // diagnostics only
+        aapsLogger.info(LTag.APS, "HealthConnectHrIngest: window [${sinceMs}..${nowMs}] records=${resp.records.size} backfilled=$inserted skipped-live=$skippedCovered set=${ingestedSampleMs.size}")
     }
 
     /** Force a sync regardless of throttle — e.g. from a settings "test now" button. Returns immediately; result via logs. */

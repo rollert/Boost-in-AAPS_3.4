@@ -80,34 +80,46 @@ object StepService : SensorEventListener {
         return stepCount
     }
 
-    // ── Cumulative steps-since-local-midnight (2026-06-19, intraday activity-load shadow) ──
-    // The hardware TYPE_STEP_COUNTER value (previousStepCount) is cumulative-since-boot. Today's
-    // steps = current − a baseline captured at local midnight. Zero extra cost: the sensor is
-    // already running; getStepsToday() is one subtraction off in-memory state, called once/cycle.
+    // ── Cumulative steps-since-local-midnight (2026-06-19; reset-resilient 2026-06-24) ──
+    // The phone is the authoritative step source (Garmin→HC is unreliable). The hardware
+    // TYPE_STEP_COUNTER (previousStepCount) is cumulative-since-boot. Rather than a midnight-baseline
+    // subtraction (which loses the whole day if the counter ever resets below the baseline), we
+    // ACCUMULATE per-call deltas into todaySteps. A reset/reboot (cur < lastRaw) adds `cur` (the
+    // post-reset steps) instead of zeroing. Survives reboots and sensor glitches; ~free per call.
     @Volatile private var dayKey = -1L
-    @Volatile private var midnightRaw = -1
+    @Volatile private var lastRaw = -1        // previous cumulative-since-boot reading
+    @Volatile private var todaySteps = 0      // accumulated steps since local midnight
 
-    /** Steps since local midnight from the phone pedometer. Re-baselines on day rollover / reboot. */
+    private fun localDay(localOffsetMs: Long) = (System.currentTimeMillis() + localOffsetMs) / 86_400_000L
+
+    /** Steps since local midnight from the phone pedometer. Accumulates; resilient to counter resets. */
     @Synchronized fun getStepsToday(localOffsetMs: Long): Int {
         val cur = previousStepCount
-        if (cur < 0) return 0
-        val day = (System.currentTimeMillis() + localOffsetMs) / 86_400_000L
-        if (day != dayKey || midnightRaw < 0 || cur < midnightRaw) {  // new local day, uninit, or reboot
-            midnightRaw = cur; dayKey = day
+        val day = localDay(localOffsetMs)
+        if (day != dayKey) {                  // local-day rollover → start the new day clean
+            dayKey = day; todaySteps = 0; lastRaw = cur
+            return 0
         }
-        return (cur - midnightRaw).coerceAtLeast(0)
+        if (cur < 0) return todaySteps        // no sensor reading yet this boot
+        if (lastRaw < 0) { lastRaw = cur; return todaySteps }
+        todaySteps += stepDelta(cur, lastRaw)
+        lastRaw = cur
+        return todaySteps
     }
 
+    /** Step increment between two cumulative-since-boot readings, resilient to a counter reset:
+     *  forward → the delta; reset/reboot (cur < lastRaw) → `cur` (steps counted since the reset). */
+    internal fun stepDelta(cur: Int, lastRaw: Int): Int = if (cur >= lastRaw) cur - lastRaw else cur
+
     /**
-     * One-time seed so a mid-day app start counts today's earlier steps: sets the midnight baseline
-     * so getStepsToday() returns [hcTodaySteps] now, then the live sensor carries on from there.
-     * Caller invokes this once (after the first Health Connect sync). No-op until a sensor reading
-     * exists. A real midnight rollover later re-zeros without needing HC again.
+     * Reconcile with Health Connect's today total: only ever hold the HIGHER of the phone-accumulated
+     * count and HC, never anchor downward. Lets a mid-day app start pick up earlier steps from HC,
+     * and a post-restart phone count recover, without HC's lag ever pulling the live count backwards.
      */
     @Synchronized fun seedTodayFromHc(hcTodaySteps: Int, localOffsetMs: Long) {
-        val cur = previousStepCount
-        if (cur < 0) return
-        midnightRaw = (cur - hcTodaySteps).coerceIn(0, cur)
-        dayKey = (System.currentTimeMillis() + localOffsetMs) / 86_400_000L
+        val day = localDay(localOffsetMs)
+        if (day != dayKey) { dayKey = day; lastRaw = previousStepCount }
+        if (hcTodaySteps > todaySteps) todaySteps = hcTodaySteps
+        if (lastRaw < 0) lastRaw = previousStepCount
     }
 }

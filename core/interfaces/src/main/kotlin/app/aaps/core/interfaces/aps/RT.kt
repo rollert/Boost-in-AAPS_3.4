@@ -131,6 +131,7 @@ data class RT(
     var boostActivityLoad_stepsToday: Int? = null,      // cumulative steps since local midnight (phone)
     var boostActivityLoad_intradayRatio: Double? = null, // stepsToday ÷ expected-by-now
     var boostActivityLoad_intradayDeltaIsfPct: Double? = null, // raise-only would-ΔISF from intraday pace
+    var boostActivityLoad_stepsSource: String? = null,  // "wear" (worn AAPS Wear watch) | "phone" (pedometer)
 
     // Autosens / TDD-DynISF coordination telemetry (2026-06-16). Which mechanism drives basal +
     // the would-be alternative, so ApsBoostAutosensWhenNoTdd can be validated before being enabled.
