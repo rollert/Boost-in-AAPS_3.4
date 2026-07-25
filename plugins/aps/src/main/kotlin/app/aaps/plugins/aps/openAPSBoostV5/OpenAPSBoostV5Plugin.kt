@@ -28,10 +28,13 @@ import app.aaps.core.interfaces.notifications.Notification
 import app.aaps.core.interfaces.stats.TddCalculator
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.DateUtil
+import app.aaps.core.keys.BooleanComposedKey
 import app.aaps.core.keys.BooleanKey
 import app.aaps.core.keys.DoubleKey
+import app.aaps.core.keys.IntNonKey
 import app.aaps.core.keys.UnitDoubleKey
 import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.plugins.aps.getBoostDosing
 import app.aaps.core.validators.preferences.AdaptiveDoublePreference
 import app.aaps.core.validators.preferences.AdaptiveSwitchPreference
 import app.aaps.core.validators.preferences.AdaptiveUnitPreference
@@ -43,6 +46,7 @@ import java.time.ZoneId
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
+import app.aaps.plugins.aps.openAPSBoost.BoostRiskModel
 import app.aaps.plugins.aps.openAPSBoost.OpenAPSBoostPlugin
 import kotlin.math.abs
 import kotlin.math.max
@@ -61,7 +65,9 @@ import kotlin.math.max
  *   Phase 3 — ordered safety gates (hard gates → soft gates ordered → final clamp)
  *
  * Design tenets:
- *   - Minimal user settings: ≤3 user-facing knobs; ~14–15 internal constants frozen at release.
+ *   - Minimal user settings: 3 headline tuning knobs (Aggression / Hypo Caution / Sensitivity)
+ *     plus a small advanced set (dose caps, fast-carb toggle, pre-meal target); ~14–15 internal
+ *     constants frozen at release.
  *   - Sensitivity inheritance: baseInsulinReq is Boost-flavoured oref (DynISF + 7D TDD with W8H
  *     pull-down + TDD-anchored EMA sensitivity + autosens + hour-of-day ISF + TempTargets).
  *     V5 contains NO sensitivity logic of its own.
@@ -91,6 +97,9 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
     private val constraintsChecker: ConstraintsChecker,
     private val dateUtil: DateUtil,
     private val uiInteraction: UiInteraction,
+    // @Singleton — same instance the V1 engine scored this cycle; its cached feature vector powers
+    // the projected-IOB re-score for Phase-3 postActionRiskCheck. (2026-07-02)
+    private val boostRiskModel: BoostRiskModel,
 ) : PluginBase(
     PluginDescription()
         .mainType(PluginType.APS)
@@ -138,27 +147,119 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         openAPSBoostEngine.get().runEngine(initiator, tempBasalFallback, v5Active = true)
     }
 
+    /** Per-knob auto-config resolution marks (argument = the managed preference's key string). */
+    private fun isResolved(prefKey: String) = preferences.get(BooleanComposedKey.BoostV5AutoConfigResolved, prefKey)
+    private fun markResolved(prefKey: String) = preferences.put(BooleanComposedKey.BoostV5AutoConfigResolved, prefKey, value = true)
+
+    /** Auto-config-managed boolean dosing switches (2026-07-17 convention: every new dosing switch is
+     *  auto-config managed). Each resolves once, suggestion-only, exactly like the double knobs. */
+    private val managedBooleanKeys = listOf(
+        BooleanKey.ApsBoostV5FastCarbConfirm,
+        BooleanKey.ApsBoostV5AggressiveEarlyConfirm,
+        BooleanKey.ApsBoostV5VelocityBudgetActive,
+    )
+
+    private fun suggestionBoolean(s: BoostV5AutoConfig.V5Suggestion, key: BooleanKey): Boolean = when (key) {
+        BooleanKey.ApsBoostV5FastCarbConfirm         -> s.fastCarbConfirm
+        BooleanKey.ApsBoostV5AggressiveEarlyConfirm  -> s.aggressiveEarlyConfirm
+        BooleanKey.ApsBoostV5VelocityBudgetActive    -> s.velocityBudgetFloor
+        else                                         -> key.defaultValue
+    }
+
     /**
-     * Populate the V5 knobs from the user's last-14-day V1 dosing + glycaemia the first time V5 runs
-     * active. Suggestion-only: writes a knob ONLY if the user hasn't already set it (getIfExists ==
-     * null). If there isn't enough history yet, does nothing and leaves the flag UNSET so it retries
-     * on a later cycle once data accrues. Never changes the dosing path itself — only its settings.
+     * Populate the V5 knobs from the user's last-14-day V1 dosing + glycaemia when V5/V6 runs
+     * active. Suggestion-only: writes a knob ONLY while the user hasn't changed it from a factory
+     * default — ANY factory default the key ever shipped with, so old-build users aren't frozen at
+     * an old era's value (a value merely *persisted at* a default — settings import, pref-dialog
+     * OK — does not block it). Dose-cap RAISES are additionally held back (surfaced as suggestions)
+     * when the 14-day TBR<70 exceeds [BoostV5AutoConfigApply.TBR_RAISE_GUARD_PCT]. Each knob
+     * resolves individually (see [BoostV5AutoConfigApply]): applied once, or skipped, and then
+     * never revisited. If there isn't enough history yet, nothing resolves and every open knob
+     * retries on a later cycle once data accrues. Never changes the dosing path itself — only its
+     * settings.
      */
+    // 2026-07-08: composed brake-floor hypo-gate. The floor is insulin-ADDING, so it may only engage
+    // when the user's trailing-14d time-below-63 mg/dL (3.5 mmol) is under COMPOSED_FLOOR_MAX_TBR63_PCT.
+    // A 14-day metric moves slowly, so it is recomputed at most hourly and cached; fail-closed (the
+    // floor stays off) until the first successful compute and whenever CGM history is too thin.
+    private val TBR_GATE_REFRESH_MS = 60L * 60 * 1000         // hourly
+    private val TBR_GATE_MIN_READINGS = 1000                  // ~3.5 days of 5-min CGM before the % is trusted
+    @Volatile private var cachedTbrBelow63Pct: Double? = null
+    @Volatile private var cachedTbrBelow70Pct: Double? = null
+    @Volatile private var lastTbrGateComputeMs: Long = 0L
+
+    /** Throttled trailing-14d time-below-63 AND -70 mg/dL, then the fail-closed floor hypo-gate. */
+    internal fun composedFloorTbrAllowed(now: Long): Boolean {
+        if (cachedTbrBelow63Pct == null || now - lastTbrGateComputeMs >= TBR_GATE_REFRESH_MS) {
+            val start = now - BoostV5AutoConfig.LOOKBACK_DAYS * 24L * 60 * 60 * 1000
+            val bgs = persistenceLayer.getBgReadingsDataFromTimeToTime(start, now, true)
+            val n = bgs.size
+            if (n >= TBR_GATE_MIN_READINGS) {
+                cachedTbrBelow63Pct = 100.0 * bgs.count { it.value >= 1.0 && it.value < 63.0 } / n
+                cachedTbrBelow70Pct = 100.0 * bgs.count { it.value >= 1.0 && it.value < 70.0 } / n
+            } else {
+                cachedTbrBelow63Pct = null; cachedTbrBelow70Pct = null
+            }
+            lastTbrGateComputeMs = now
+        }
+        return composedFloorAllowedByTbr(cachedTbrBelow63Pct, cachedTbrBelow70Pct)
+    }
+
     private fun maybeAutoConfigure() {
-        if (preferences.get(BooleanKey.ApsBoostV5AutoConfigDone)) return
+        // Migration from the legacy global one-shot flag (raw read — get() would mask it in simple
+        // mode): mark resolved ONLY knobs whose stored value differs from the factory default (they
+        // were plausibly applied by the old run, or user-set — don't rewrite them). Knobs still AT
+        // factory default become eligible again — rescues installs where the old key-presence test
+        // or a consumed/imported flag wrongly skipped them (field case: user H, committedCap stuck
+        // at factory 0.5 with a derived 1.24). Clearing the flag makes the migration one-shot.
+        if (preferences.getIfExists(BooleanKey.ApsBoostV5AutoConfigDone) == true) {
+            val migrated = BoostV5AutoConfigApply.migrateLegacyDoneFlag(
+                BoostV5AutoConfigApply.managedDoubleKeys,
+                storedValue = { preferences.getIfExists(it) },
+                markResolved = { markResolved(it.key) }
+            ).map { it.key }.toMutableList()
+            val fc = BooleanKey.ApsBoostV5FastCarbConfirm
+            if (preferences.getIfExists(fc).let { it != null && it != fc.defaultValue }) {
+                markResolved(fc.key); migrated += fc.key
+            }
+            preferences.put(BooleanKey.ApsBoostV5AutoConfigDone, false)
+            aapsLogger.info(LTag.APS, "BoostV5 auto-config: migrated legacy done-flag → per-key; resolved=$migrated")
+        }
+
+        // Versioned re-migration of the persisted resolved flags (idempotent; stamps the schema
+        // version; MUST run before the steady-state early-return — a stranded install has every
+        // knob resolved). v2 rescues knobs the promoted 2026-07-06 APK's era-blind isUserTuned
+        // mis-resolved at OLD factory values — see BoostV5AutoConfigApply.AUTO_CONFIG_SCHEMA_VERSION.
+        BoostV5AutoConfigApply.runSchemaMigrations(
+            storedVersion = preferences.get(IntNonKey.BoostV5AutoConfigSchemaVersion),
+            keys = BoostV5AutoConfigApply.managedDoubleKeys,
+            isResolved = { isResolved(it.key) },
+            storedValue = { preferences.getIfExists(it) },
+            clearResolved = { preferences.remove(BooleanComposedKey.BoostV5AutoConfigResolved, it.key) },
+            setVersion = { preferences.put(IntNonKey.BoostV5AutoConfigSchemaVersion, it) }
+        ).forEach {
+            aapsLogger.info(
+                LTag.APS,
+                "BoostV5 auto-config re-migration v2: ${it.key} value ${preferences.getIfExists(it)} matches historical factory — re-opened for derivation"
+            )
+        }
+
+        // Steady state: everything resolved → nothing to do (cheap check, no data pulls).
+        val allKeys = BoostV5AutoConfigApply.managedDoubleKeys.map { it.key } + managedBooleanKeys.map { it.key }
+        if (allKeys.all { isResolved(it) }) return
 
         val now = dateUtil.now()
-        val start = now - 14L * 24 * 60 * 60 * 1000
+        val start = now - BoostV5AutoConfig.LOOKBACK_DAYS * 24L * 60 * 60 * 1000
 
         // TDD (median over available days) + days-of-data.
-        val tdds = tddCalculator.calculate(14, allowMissingDays = true)
+        val tdds = tddCalculator.calculate(BoostV5AutoConfig.LOOKBACK_DAYS, allowMissingDays = true)
         val tddValues = mutableListOf<Double>()
         if (tdds != null) for (i in 0 until tdds.size()) {
             val t = tdds.valueAt(i)
             val total = if (t.totalAmount > 0) t.totalAmount else t.basalAmount + t.bolusAmount
             if (total > 0) tddValues.add(total)
         }
-        val tddMedian = median(tddValues)
+        val tddMedian = BoostV5AutoConfig.percentile(tddValues, 50.0)
         val daysWithData = tddValues.size
 
         // Boluses split into manual (meal) vs SMB.
@@ -169,8 +270,8 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         // Glycaemia (TBR / severe / mean) from CGM.
         val bgs = persistenceLayer.getBgReadingsDataFromTimeToTime(start, now, true)
         val n = bgs.size
-        val tbr70 = if (n > 0) 100.0 * bgs.count { it.value in 1.0..69.9 } / n else 0.0
-        val sev54 = if (n > 0) 100.0 * bgs.count { it.value in 1.0..53.9 } / n else 0.0
+        val tbr70 = if (n > 0) 100.0 * bgs.count { it.value >= 1.0 && it.value < 70.0 } / n else 0.0
+        val sev54 = if (n > 0) 100.0 * bgs.count { it.value >= 1.0 && it.value < 54.0 } / n else 0.0
         val meanBg = if (n > 0) bgs.sumOf { it.value } / n else 0.0
 
         val suggestion = BoostV5AutoConfig.compute(
@@ -183,30 +284,63 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
             )
         )
         if (suggestion == null) {
+            // Nothing resolves here: every open knob stays eligible and genuinely retries next cycle.
             aapsLogger.info(LTag.APS, "BoostV5 auto-config: insufficient V1 history (days=$daysWithData, bg=$n) — will retry")
             return
         }
 
-        // Apply only knobs the user (or a preset) hasn't already set. Per-knob & independent — a
-        // preset value is KEPT and never blocks the others (see BoostV5AutoConfigApply, unit-tested).
-        val applied = mutableListOf<String>()
-        BoostV5AutoConfigApply.applyAutoConfig(
-            BoostV5AutoConfigApply.managedDoubleKnobs(suggestion),
-            isSet = { preferences.getIfExists(it) != null },
-            put = { key, value -> preferences.put(key, value) }
-        ).forEach { (key, value) -> applied += "${key.key}=$value" }
-        if (preferences.getIfExists(BooleanKey.ApsBoostV5FastCarbConfirm) == null) {
-            preferences.put(BooleanKey.ApsBoostV5FastCarbConfirm, suggestion.fastCarbConfirm)
-            applied += "fastCarbConfirm=${suggestion.fastCarbConfirm}"
+        // Apply only knobs the user (or a preset) hasn't TUNED (stored value differs from EVERY
+        // factory default the key ever shipped with). Per-knob & independent — a tuned value is
+        // KEPT and never blocks the others; each knob resolves (applied / kept-user-tuned /
+        // suggested-not-applied) exactly once (see BoostV5AutoConfigApply, unit-tested). Dose-cap
+        // RAISES are held back (suggestion-only) when TBR<70 exceeds the guard threshold; the
+        // cumulative cap is recomputed inside from the final operative per-shot caps.
+        val resolutions = BoostV5AutoConfigApply.applyAutoConfig(
+            suggestion,
+            tbrBelow70Pct = tbr70,
+            timeBelow54Pct = sev54,
+            isResolved = { isResolved(it.key) },
+            storedValue = { preferences.getIfExists(it) },
+            put = { key, value -> preferences.put(key, value) },
+            markResolved = { markResolved(it.key) }
+        )
+        // Log every classification verbatim so field diagnosis never needs inference.
+        fun shortName(key: DoubleKey) = key.name.removePrefix("ApsBoostV5").removePrefix("ApsBoost")
+        resolutions.forEach { aapsLogger.info(LTag.APS, "BoostV5 auto-config: ${it.key.key} → ${it.reason}") }
+        val applied = resolutions.filter { it.outcome == BoostV5AutoConfigApply.Outcome.APPLIED }
+            .map { "${shortName(it.key)}=${it.suggestedValue}" }.toMutableList()
+        // Boolean managed keys. 2026-07-17 convention: every new dosing switch is auto-config managed
+        // (not shipped OFF-for-everyone requiring manual discovery). Same suggestion-only, per-key,
+        // resolve-once semantics as the double knobs — write only a key still at a factory default.
+        for (bk in managedBooleanKeys) {
+            if (isResolved(bk.key)) continue
+            val value = suggestionBoolean(suggestion, bk)
+            val stored = preferences.getIfExists(bk)
+            if (stored == null || stored == bk.defaultValue) {
+                preferences.put(bk, value)
+                if (value != bk.defaultValue) applied += "${bk.name.removePrefix("ApsBoostV5")}=$value"
+            }
+            markResolved(bk.key)
         }
 
-        preferences.put(BooleanKey.ApsBoostV5AutoConfigDone, true)
         aapsLogger.info(LTag.APS, "BoostV5 auto-config applied [$applied]; rationale: ${suggestion.rationale}")
-        // Only surface a banner if we ACTUALLY changed something. If every knob was already tuned by
-        // the user, putDoubleIfUnset is a no-op (applied is empty) — announcing "configured" then
-        // changing nothing was the confusing behaviour Tim hit. One concise, readable line per knob.
-        if (applied.isNotEmpty()) {
-            val pretty = applied.joinToString("\n") { "• " + it.removePrefix("ApsBoostV5").removePrefix("ApsBoost") }
+        // Only surface a banner if we ACTUALLY changed something or have a held-back suggestion to
+        // show. If every knob was already tuned by the user, applyAutoConfig skips it — announcing
+        // "configured" then changing nothing was the confusing behaviour Tim hit. One concise,
+        // readable line per knob; TBR-held cap raises are surfaced as manual suggestions.
+        val heldSuggestions = resolutions.filter { it.outcome == BoostV5AutoConfigApply.Outcome.SUGGESTED_NOT_APPLIED_TBR }
+            .map {
+                // Name whichever guard(s) actually tripped (<70 raise-guard and/or the 2026-07-07
+                // <54 severe co-guard) so the user sees why the raise was held.
+                val why = buildList {
+                    if (tbr70 > BoostV5AutoConfigApply.TBR_RAISE_GUARD_PCT) add("time-below-70 is ${Math.round(tbr70 * 10.0) / 10.0}%")
+                    if (sev54 >= BoostV5AutoConfigApply.TBR54_RAISE_GUARD_PCT) add("time-below-54 is ${Math.round(sev54 * 10.0) / 10.0}%")
+                }.joinToString(" and ")
+                "${shortName(it.key)}: suggested ${it.suggestedValue} U from your history — not auto-applied because " +
+                    "$why; set manually in Advanced if desired"
+            }
+        if (applied.isNotEmpty() || heldSuggestions.isNotEmpty()) {
+            val pretty = (applied + heldSuggestions).joinToString("\n") { "• $it" }
             uiInteraction.addNotification(
                 Notification.USER_MESSAGE,
                 "Boost V6 set ${applied.size} setting(s) from your last 14 days (your other settings were kept):\n$pretty",
@@ -215,25 +349,22 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         }
     }
 
-    private fun median(xs: List<Double>): Double {
-        if (xs.isEmpty()) return 0.0
-        val s = xs.sorted()
-        return if (s.size % 2 == 1) s[s.size / 2] else (s[s.size / 2 - 1] + s[s.size / 2]) / 2.0
-    }
-
     // Enable/show under the same condition as plain Boost (temp-basal-capable pump) — delegate to
     // the engine so the two plugins stay in lock-step.
     override fun specialEnableCondition(): Boolean = openAPSBoostEngine.get().specialEnableCondition()
     override fun specialShowInListCondition(): Boolean = openAPSBoostEngine.get().specialShowInListCondition()
 
     /**
-     * Sidecar shadow runner. Called by V4.4.1 (`OpenAPSBoostV3MLG3Plugin.invoke()`) with the
-     * inputs and result V4.4.1 just produced. V5 sees exactly what V4.4.1 saw — no duplication
-     * of input gathering, no risk of input drift between the two algorithms.
+     * V5 decision runner. Called by the live V1 engine (`OpenAPSBoostPlugin.runEngine`) with the
+     * inputs and result the engine just produced — V5 sees exactly what V1 saw, no duplication of
+     * input gathering, no input drift. Runs in BOTH modes: `activeMode=false` (plain Boost selected;
+     * decision is telemetry-only) and `activeMode=true` (V6 selected; the engine may adopt
+     * `finalDose` as the SMB, subject to its own gates). (KDoc updated 2026-07-02 — previously
+     * described the retired V4.4.1 sidecar arrangement.)
      *
      * V5 reads:
-     *  - V4.4.1's RT for `eventualBG`, `insulinReq` (used as `baseInsulinReq`), `mlHypoRisk`,
-     *    `mlMealLikely` — V4.4.1 already ran the ML predictions.
+     *  - the engine's RT for `eventualBG`, `insulinReq` (used as `baseInsulinReq`), `mlHypoRisk`,
+     *    `mlMealLikely` — the V1 engine already ran the ML predictions.
      *  - GlucoseStatus for `delta`, `shortAvgDelta`, `longAvgDelta`, `glucose`.
      *  - OapsProfileBoost for `target_bg`, `boost_maxIOB`, `recentLowBG`, `lgsThreshold`,
      *    and the `v5_*` activity fields V4.4.1 fills (exerciseActive, inPostExerciseWindow).
@@ -244,10 +375,11 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
      *  - Its own meal_signal_score, MealHypothesis transition, AggressionBudget, action
      *    multiplier, Phase 3 gates via [determineBasalBoostV5.decide].
      *
-     * Output: V5 RT JSON logged via aapsLogger at INFO with prefix "BoostV5_RT:" — Tim greps
-     * logs to compare V5 shadow decisions against V4.4.1's actual delivery.
+     * Output: V5 RT JSON logged via aapsLogger at INFO with prefix "BoostV5_RT:" and the
+     * boostV5_* RT fields for NS — comparing V5 decisions against V1's delivery.
      *
-     * Safety: any exception is caught and logged; V5 never propagates an error to V4.4.1.
+     * Safety: any exception is caught and logged; V5 never propagates an error to the engine
+     * (the engine falls back to its own dose).
      */
     fun runShadow(
         rT: RT,
@@ -259,10 +391,13 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         microBolusAllowed: Boolean = true,
         flatBGsDetected: Boolean = false,
         asleep: Boolean = false,
+        // 2026-07-06: post-rescue window flag (recentLowBG45Min < 75), computed by the engine at
+        // the override seam. Gates the composed-floor SHADOW off; no dosing-path use in V5.
+        postRescueWindow: Boolean = false,
     ): V5Decision? {
         return try {
             val priorState = stateStore.load()
-            val inputs = buildInputs(rT, glucoseStatus, iobArray, oapsProfile, pumpBolusStep, activeMode, microBolusAllowed, flatBGsDetected, asleep)
+            val inputs = buildInputs(rT, glucoseStatus, iobArray, oapsProfile, pumpBolusStep, activeMode, microBolusAllowed, flatBGsDetected, asleep, postRescueWindow)
             val decision = determineBasalBoostV5.decide(inputs, priorState)
             stateStore.save(decision.newPersistedState)
 
@@ -277,8 +412,31 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
             rT.boostV5_budget = decision.aggressionBudget.budget
             rT.boostV5_actionMult = decision.actionMultiplier
             rT.boostV5_finalDose = decision.finalDose
+            // Dose-chain intermediates (2026-07-10) so an offline port can be fidelity-validated
+            // stage-by-stage: raw(budget×actionMult) → doseAfterCaps → doseAfterBrakes → finalDose.
+            rT.boostV5_velocityFactor = decision.velocityFactor
+            rT.boostV5_doseAfterCaps = decision.insulinToDeliver
+            rT.boostV5_doseAfterBrakes = decision.phase3.finalDose
             rT.boostV5_gateReduction = formatGateReduction(decision)
             rT.boostV5_active = activeMode   // true => V5 is the selected/active doser (drives the V5 overview/widget)
+            // Log the live per-user dose caps so the OBSERVING→CONFIRMED gate can be backtested against
+            // REAL caps (not inferred/auto-formula estimates) and manual overrides are captured. (2026-07-02)
+            rT.boostV5_committedCap = preferences.getBoostDosing(DoubleKey.ApsBoostV5CommittedCapU)
+            rT.boostV5_confirmedCap = preferences.getBoostDosing(DoubleKey.ApsBoostV5ConfirmedCapU)
+            // 2026-07-03 confirm-gate telemetry for the 2026-07-10 live gate review — a dose-adequacy
+            // gate block was previously indistinguishable from a score fade in NS. Read-only.
+            rT.boostV5_confirmGate = decision.confirmGate
+            rT.boostV5_prospectiveShot = decision.prospectiveConfirmShot
+            rT.boostV5_aggressionKnob = aggressionKnob
+            // 2026-07-06 composed floor — DUAL semantics keyed on the Advanced toggle (see
+            // composedFloorTargetDose + V5Decision.floorWouldAdd KDocs): toggle OFF = SHADOW,
+            // extra U the Phase-3 floor (F=0.25) WOULD have added this cycle; toggle ON (per-user
+            // activation) = the uplift actually APPLIED to finalDose. Null = floor conditions
+            // unmet either way, so the 07-10 review reads one field regardless.
+            rT.boostV5_floorWouldAdd = decision.floorWouldAdd
+            // 2026-07-17 velocity-budget floor — same DUAL would/applied semantics keyed on the
+            // ApsBoostV5VelocityBudgetActive toggle (see velocityBudgetFloorTarget). Null = conditions unmet.
+            rT.boostV5_velocityBudgetWouldAdd = decision.velocityBudgetWouldAdd
 
             val rtJson = v5DecisionToRtJson(decision)
             aapsLogger.info(LTag.APS, "BoostV5_RT: ${rtJson} actual_smb=${rT.units ?: 0.0} actual_insulinReq=${rT.insulinReq ?: 0.0} activeMode=$activeMode")
@@ -317,18 +475,9 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         return mins.minOrNull()
     }
 
-    /** Same compact summary used in the log line and in `v5DecisionToRtJson`'s gate string. */
-    private fun formatGateReduction(decision: V5Decision): String {
-        val parts = mutableListOf<String>()
-        decision.phase3.reductions.iobHeadroomBrake.takeIf { it < 1.0 }?.let { parts.add("iobHeadroom:${"%.2f".format(java.util.Locale.US, it)}") }
-        decision.phase3.reductions.postActionRiskCheck.takeIf { it < 1.0 }?.let { parts.add("postAction:${"%.2f".format(java.util.Locale.US, it)}") }
-        decision.phase3.reductions.decelerationBrake.takeIf { it < 1.0 }?.let { parts.add("decel:${"%.2f".format(java.util.Locale.US, it)}") }
-        decision.phase3.reductions.sensorQualityCheck.takeIf { it < 1.0 }?.let { parts.add("sensor:${"%.2f".format(java.util.Locale.US, it)}") }
-        decision.phase3.reductions.hardGateFired?.let { parts.add("HARD:$it") }
-        if (decision.phase3.reductions.maxIobClampApplied) parts.add("maxIOB")
-        if (decision.phase3.reductions.dynamicSpikeCapped) parts.add("spike")
-        return parts.joinToString(",").ifEmpty { "none" }
-    }
+    /** Delegates to the single shared formatter (V5StateStore.kt) — the same string goes to the
+     *  rT field, the log line, and v5DecisionToRtJson, so the three can never diverge. (2026-07-02) */
+    private fun formatGateReduction(decision: V5Decision): String = formatGateReduction(decision.phase3.reductions)
 
     private fun buildInputs(
         rT: RT,
@@ -339,7 +488,8 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         activeMode: Boolean,
         microBolusAllowed: Boolean,
         flatBGsDetected: Boolean,
-        asleep: Boolean = false,
+        asleep: Boolean,
+        postRescueWindow: Boolean,
     ): V5Inputs {
         // delta_accl with V3's denominator floor — `max(|shortAvgDelta|, 2.0)` — carried over
         // verbatim from V3 input preprocessing.
@@ -363,7 +513,9 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
 
         val iob = iobArray.firstOrNull()?.iob ?: 0.0
 
-        val hour = LocalTime.now(ZoneId.systemDefault()).hour
+        // Hour from dateUtil (not wall-clock LocalTime.now()) so tests/replays can fake time like
+        // every other time read in this class. (2026-07-02)
+        val hour = java.time.Instant.ofEpochMilli(dateUtil.now()).atZone(ZoneId.systemDefault()).hour
 
         // V0 SHADOW MODE: enableSmbPreChecks is permissive — V5 makes its own decision and the
         // operator compares against V4.4.1's actual delivery. Earlier code derived this from
@@ -403,16 +555,41 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
             enableSmbPreChecks = enableSmbPreChecks,
             mlHypoRisk = rT.mlHypoRisk,
             mlMealLikely = rT.mlMealLikely,
-            riskAtProjectedIob = null,         // Phase 3 postActionRiskCheck disabled in V0; V4.4.1's
-                                               // postSmbScale already runs against rT.units; V5 doesn't
-                                               // re-run the model in shadow.
+            // 2026-07-02: postActionRiskCheck LIVE. Re-scores the (singleton) risk model at
+            // projected IOB using this cycle's cached feature vector. Previously null since
+            // V0-shadow — but in ACTIVE mode V5 replaces rT.units AFTER V1's postSmbScale ran,
+            // so the delivered dose had neither damper. Null/unavailable → current risk
+            // (gate passes through unchanged).
+            riskAtProjectedIob = { projIob -> boostRiskModel.predictAtProjectedIob(projIob) ?: (rT.mlHypoRisk ?: 0.0) },
             recentLowBg = opb.recentLowBG,
             cumulativeRise30min = cumulativeRise30min,
             hour = hour,
             exerciseActive = opb.v5_exerciseActive,
             inPostExerciseWindow = opb.v5_inPostExerciseWindow,
             asleep = asleep,
-            fastCarbConfirmEnabled = preferences.get(BooleanKey.ApsBoostV5FastCarbConfirm),
+            // 2026-07-06 composed-floor inputs (see V5Inputs KDocs):
+            postRescueWindow = postRescueWindow,
+            // rT.units here is V1's dose — runShadow runs before the engine's V6 override seam.
+            v1WouldDoseU = rT.units,
+            // 2026-07 composed brake-floor ACTIVATION — Advanced toggle, default OFF. Gated on:
+            // (1) activeMode, so the floor only ever alters finalDose when V6 is the selected doser
+            //     (in shadow mode the field keeps its pre-activation would-add semantics regardless);
+            // (2) 2026-07-08 ENFORCED hypo-gate — trailing-14d time-below-63 mg/dL < 2.0% (fail-closed).
+            //     The floor is insulin-adding, so it cannot engage for a hypo-prone user even if toggled on.
+            composedFloorActive = activeMode &&
+                preferences.getBoostDosing(BooleanKey.ApsBoostV5ComposedFloorActive) &&
+                composedFloorTbrAllowed(dateUtil.now()),
+            // 2026-07-17 velocity-budget floor (budget≈0 high tail) — same three-part activation as the
+            // composed floor: V6 active, per-user Advanced toggle ON, and the SAME fail-closed 14d-TBR
+            // gate (the floor is insulin-adding, so it never engages for a hypo-prone user).
+            velocityBudgetActive = activeMode &&
+                preferences.getBoostDosing(BooleanKey.ApsBoostV5VelocityBudgetActive) &&
+                composedFloorTbrAllowed(dateUtil.now()),
+            fastCarbConfirmEnabled = preferences.getBoostDosing(BooleanKey.ApsBoostV5FastCarbConfirm),
+            // 2026-07-17 aggressive early-confirm — opt-in + auto-config managed (age −2). Read raw
+            // (mask-bypassed) like the other dosing toggles; applies in BOTH shadow and active modes
+            // (it changes the state transition, not the delivered dose directly).
+            aggressiveEarlyConfirmEnabled = preferences.getBoostDosing(BooleanKey.ApsBoostV5AggressiveEarlyConfirm),
             sensorQualityOk = if (activeMode) !flatBGsDetected else true,
             profileSwitched = false,           // deferred reset trigger (microBolusAllowed gates actual dosing)
             pumpDisconnected = false,
@@ -421,8 +598,8 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
             aggressionUserKnob = aggressionKnob,
             hypoCautionUserKnob = hypoCautionKnob,
             sensitivityUserKnob = sensitivityKnob,
-            confirmedCapU = preferences.get(DoubleKey.ApsBoostV5ConfirmedCapU),
-            committedCapU = preferences.get(DoubleKey.ApsBoostV5CommittedCapU),
+            confirmedCapU = preferences.getBoostDosing(DoubleKey.ApsBoostV5ConfirmedCapU),
+            committedCapU = preferences.getBoostDosing(DoubleKey.ApsBoostV5CommittedCapU),
         )
     }
 
@@ -466,9 +643,10 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
     override fun preprocessPreferences(preferenceFragment: PreferenceFragmentCompat) =
         openAPSBoostEngine.get().preprocessPreferences(preferenceFragment)
 
-    /** V5's three (and only three) user-facing knobs, per the minimal-settings tenet. */
-    val aggressionKnob: Double get() = preferences.get(DoubleKey.ApsBoostV5Aggression)
-    val hypoCautionKnob: Double get() = preferences.get(DoubleKey.ApsBoostV5HypoCaution)
+    /** V5's three HEADLINE tuning knobs (advanced settings — caps, fast-carb, pre-meal — live on
+     *  the preference screen; these three are the per-user calibration surface). */
+    val aggressionKnob: Double get() = preferences.getBoostDosing(DoubleKey.ApsBoostV5Aggression)
+    val hypoCautionKnob: Double get() = preferences.getBoostDosing(DoubleKey.ApsBoostV5HypoCaution)
 
     /**
      * Sensitivity knob ∈ [0.8, 1.2] — per-user calibration multiplier on the aggression budget.
@@ -477,7 +655,17 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
      * resistant users) is warranted. This is the lever a future nightly per-user learner will
      * drive (loop deferred — see boost_v6_delivery_plan Phase 3). Default 1.0 = no change.
      */
-    val sensitivityKnob: Double get() = preferences.get(DoubleKey.ApsBoostV5Sensitivity)
+    val sensitivityKnob: Double get() = preferences.getBoostDosing(DoubleKey.ApsBoostV5Sensitivity)
+
+    // Preference sub-screens this plugin may (re)build — the V5 root, the Advanced parent, and the
+    // shared engine sub-screens (they live nested under "Advanced" and are rebuilt by key when
+    // navigated into). Must stay in lock-step with the keys used in OpenAPSBoostPlugin's screens.
+    private val prefScreenKeys = setOf(
+        "openapsboostv5_settings", "boost_advanced_settings", "absorption_smb_advanced",
+        "boost_default_aaps_settings", "boost_dynisf_settings", "boost_exercise_settings",
+        "boost_stepcount_settings", "boost_hr_integration_settings",
+        "boost_post_exercise_recovery_settings", "boost_night_mode_settings", "boost_safety_settings",
+    )
 
     override fun addPreferenceScreen(
         preferenceManager: PreferenceManager,
@@ -485,21 +673,7 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
         context: Context,
         requiredKey: String?,
     ) {
-        // Allow the V5 root, the Advanced parent, AND the shared engine sub-screen keys (rebuilt
-        // by name when navigated into; they now live nested under "Advanced").
-        if (requiredKey != null &&
-            requiredKey != "openapsboostv5_settings" &&
-            requiredKey != "boost_advanced_settings" &&
-            requiredKey != "absorption_smb_advanced" &&
-            requiredKey != "boost_default_aaps_settings" &&
-            requiredKey != "boost_dynisf_settings" &&
-            requiredKey != "boost_exercise_settings" &&
-            requiredKey != "boost_stepcount_settings" &&
-            requiredKey != "boost_hr_integration_settings" &&
-            requiredKey != "boost_post_exercise_recovery_settings" &&
-            requiredKey != "boost_night_mode_settings" &&
-            requiredKey != "boost_safety_settings"
-        ) return
+        if (requiredKey != null && requiredKey !in prefScreenKeys) return
         val category = PreferenceCategory(context)
         parent.addPreference(category)
         category.apply {
@@ -528,6 +702,9 @@ open class OpenAPSBoostV5Plugin @Inject constructor(
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostV5ConfirmedCapU, dialogMessage = R.string.boost_v5_confirmed_cap_summary, title = R.string.boost_v5_confirmed_cap_title))
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostV5CommittedCapU, dialogMessage = R.string.boost_v5_committed_cap_summary, title = R.string.boost_v5_committed_cap_title))
             addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostV5FastCarbConfirm, summary = R.string.boost_v5_fast_carb_confirm_summary, title = R.string.boost_v5_fast_carb_confirm_title))
+            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostV5AggressiveEarlyConfirm, summary = R.string.boost_v5_aggressive_early_confirm_summary, title = R.string.boost_v5_aggressive_early_confirm_title))
+            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostV5ComposedFloorActive, summary = R.string.boost_v5_composed_floor_summary, title = R.string.boost_v5_composed_floor_title))
+            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostV5VelocityBudgetActive, summary = R.string.boost_v5_velocity_budget_summary, title = R.string.boost_v5_velocity_budget_title))
             addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostV6PreMealTarget, summary = R.string.boost_v6_pre_meal_target_summary, title = R.string.boost_v6_pre_meal_target_title))
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostV6PreMealTargetMgdl, dialogMessage = R.string.boost_v6_pre_meal_target_mgdl_summary, title = R.string.boost_v6_pre_meal_target_mgdl_title))
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostV6PreMealLeadMin, dialogMessage = R.string.boost_v6_pre_meal_lead_min_summary, title = R.string.boost_v6_pre_meal_lead_min_title))

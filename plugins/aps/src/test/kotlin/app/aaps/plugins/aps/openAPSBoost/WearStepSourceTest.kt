@@ -33,6 +33,18 @@ class WearStepSourceTest {
         assertThat(WearStepSource.isFresh(emptyList(), now)).isFalse()
     }
 
+    @Test fun `resolution grace window keeps wear live through a short quiet spell`() {
+        // 2026-07-07 anti-flap: strictly-stale-but-recent wear (e.g. 20 min quiet) must still
+        // resolve as today's source — its reconstructed today-count is still valid — while a
+        // genuinely-dead feed (> 30 min) is not.
+        val now = 100 * DAY
+        val quiet20m = listOf(sc(now - 20 * 60_000, 50))
+        assertThat(WearStepSource.isFresh(quiet20m, now)).isFalse()          // strict freshness: stale
+        assertThat(WearStepSource.isRecentlyFresh(quiet20m, now)).isTrue()   // resolution: still live
+        assertThat(WearStepSource.isRecentlyFresh(listOf(sc(now - 31 * 60_000, 50)), now)).isFalse()
+        assertThat(WearStepSource.isRecentlyFresh(emptyList(), now)).isFalse()
+    }
+
     @Test fun `ignores samples outside the day window`() {
         val day0 = 100 * DAY
         val list = listOf(sc(day0 - 600_000, 999), sc(day0 + 120_000, 80))   // first is yesterday

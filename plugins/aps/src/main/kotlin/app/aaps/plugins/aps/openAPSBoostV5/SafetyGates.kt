@@ -236,7 +236,7 @@ internal fun sensorQualityCheck(sensorOk: Boolean): Double =
 
 /**
  * Per-cycle dynamic cap. Applies on EVERY cycle (V4 had spike override only on Tier 8).
- * Equal to `1.5 × baseInsulinReq` — well above any normal Phase 2 output (CONFIRMED 1.8×
+ * Equal to [DYNAMIC_SPIKE_CAP_MULTIPLIER] (2.5) × baseInsulinReq — above any normal Phase 2 output (CONFIRMED 1.8×
  * with full mlHypoRiskScale × postExerciseRecoveryModifier active would already be capped
  * by the AggressionBudget hard floor; in practice this gate fires only when both AggressionBudget
  * and Phase 2 produce an outlier, e.g. via the user-facing Aggression knob at 1.3×).

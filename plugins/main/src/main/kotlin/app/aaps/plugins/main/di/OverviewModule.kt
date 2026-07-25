@@ -3,6 +3,7 @@ package app.aaps.plugins.main.di
 import app.aaps.core.interfaces.overview.OverviewData
 import app.aaps.core.interfaces.overview.OverviewMenus
 import app.aaps.core.interfaces.profile.ProfileFunction
+import app.aaps.core.interfaces.profile.ProfileUtil
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.plugins.main.general.overview.OverviewDataImpl
@@ -50,9 +51,10 @@ abstract class OverviewModule {
         @Provides
         fun providesBoostV2GraphData(
             profileFunction: ProfileFunction,
+            profileUtil: ProfileUtil,
             preferences: Preferences,
             rh: ResourceHelper
-        ): BoostV2GraphData = BoostV2GraphData(profileFunction, preferences, rh)
+        ): BoostV2GraphData = BoostV2GraphData(profileFunction, profileUtil, preferences, rh)
     }
 
     @Module

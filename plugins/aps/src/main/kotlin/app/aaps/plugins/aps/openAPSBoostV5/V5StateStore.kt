@@ -1,7 +1,9 @@
 package app.aaps.plugins.aps.openAPSBoostV5
 
+import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.keys.StringKey
 import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.plugins.aps.getBoostDosing
 import org.json.JSONObject
 import java.util.Locale
 import kotlin.math.round
@@ -40,7 +42,7 @@ import kotlin.math.round
  *
  * See `boost_v5_multi_confirmed_investigation.md` for the full diagnosis and trace.
  */
-class V5StateStore(private val preferences: Preferences) {
+class V5StateStore(private val preferences: Preferences, private val aapsLogger: AAPSLogger? = null) {
 
     /**
      * Most recent persisted state, held in memory for synchronous read consistency.
@@ -53,7 +55,10 @@ class V5StateStore(private val preferences: Preferences) {
         // 2026-05-26 Fix 6: prefer in-memory cache; SharedPreferences only on cold start.
         cached?.let { return it }
 
-        val raw = preferences.get(StringKey.ApsBoostV5State)
+        // getBoostDosing (not get): Simple Mode masks defaultedBySM StringKeys to their "" default,
+        // which would discard the persisted V5 state-machine on cold start (post app-restart) and
+        // reset OBSERVING→CONFIRMED progress. See BoostDosingPreferences.kt.
+        val raw = preferences.getBoostDosing(StringKey.ApsBoostV5State)
         if (raw.isBlank()) {
             // Cold start with no persisted state: seed cache with default IDLE so subsequent
             // reads in the same process are consistent.
@@ -79,9 +84,15 @@ class V5StateStore(private val preferences: Preferences) {
             V5PersistedState(
                 mealHypothesis = state,
                 mlMealLikelyNullStreak = json.optInt("mlMealLikelyNullStreak", 0),
+                // lastCycleScore is deliberately NOT in the JSON blob (see V5PersistedState KDoc) —
+                // it lives only in the in-memory cache. Cold start → null → scoreReadyStreak=false
+                // → legacy confirm timing for the first cycle. (2026-07-03)
             )
-        } catch (_: Exception) {
-            // Corrupt or stale state — fall back to IDLE. Safer than carrying forward unknown state.
+        } catch (e: Exception) {
+            // Corrupt or stale state — fall back to IDLE (safer than carrying forward unknown state),
+            // LOG it, and clear the blob so it doesn't silently re-parse-and-fail on every cold start.
+            aapsLogger?.error(app.aaps.core.interfaces.logging.LTag.APS, "V5StateStore: corrupt persisted state — resetting to IDLE (${e.javaClass.simpleName}: ${e.message})")
+            preferences.put(StringKey.ApsBoostV5State, "")
             V5PersistedState()
         }
         cached = loaded
@@ -93,6 +104,8 @@ class V5StateStore(private val preferences: Preferences) {
         // write, so any subsequent load() in the same process sees the new state immediately.
         cached = state
 
+        // NOTE: lastCycleScore is intentionally NOT serialized — cache-only cross-cycle input for
+        // the sustained-score early confirm; losing it on restart fails safe. (2026-07-03)
         val json = JSONObject()
             .put("mealHypothesis", state.mealHypothesis.state.name)
             .put("mealHypothesisAge", state.mealHypothesis.ageCycles)
@@ -111,9 +124,11 @@ class V5StateStore(private val preferences: Preferences) {
 }
 
 /**
- * Names of the 6 NS RT fields V5 emits each cycle for shadow-mode observability. Reading these
- * fields plus per-cycle inputs is sufficient to fully reconstruct any V5 decision (per the
- * observability test in `boost_v5_test_plan.md`).
+ * Names of the core NS RT fields emitted via [v5DecisionToRtJson]. The plugin additionally sets
+ * `boostV5_finalDose`, `boostV5_active`, `boostV5_committedCap`, `boostV5_confirmedCap`, and (from
+ * 2026-07-03) `boostV5_confirmGate`, `boostV5_prospectiveShot`, `boostV5_aggressionKnob` directly
+ * on RT (see OpenAPSBoostV5Plugin.runShadow) — 13 fields total as of 2026-07-03. These core six
+ * plus per-cycle inputs reconstruct any V5 decision (per `boost_v5_test_plan.md`).
  */
 object V5RTFields {
     const val MEAL_SIGNAL_SCORE = "boostV5_score"
@@ -121,20 +136,26 @@ object V5RTFields {
     const val MEAL_HYPOTHESIS_AGE = "boostV5_age"
     const val AGGRESSION_BUDGET = "boostV5_budget"
     const val ACTION_MULTIPLIER = "boostV5_actionMult"
-    const val GATE_REDUCTION_PCT = "boostV5_gateReduction"
+    const val GATE_REDUCTION = "boostV5_gateReduction"   // comma-joined gate tags (not a percentage)
 }
+
+/**
+ * THE single formatter for the compact gate-reduction summary. Used by the rT field, the plugin's
+ * log line, and [v5DecisionToRtJson] — one implementation so the three can never diverge. (2026-07-02)
+ */
+fun formatGateReduction(r: GateReductions): String = listOfNotNull(
+    r.iobHeadroomBrake.takeIf { it < 1.0 }?.let { "iobHeadroom:${formatScale(it)}" },
+    r.postActionRiskCheck.takeIf { it < 1.0 }?.let { "postAction:${formatScale(it)}" },
+    r.decelerationBrake.takeIf { it < 1.0 }?.let { "decel:${formatScale(it)}" },
+    r.sensorQualityCheck.takeIf { it < 1.0 }?.let { "sensor:${formatScale(it)}" },
+    r.hardGateFired?.let { "HARD:$it" },
+    if (r.maxIobClampApplied) "maxIOB" else null,
+    if (r.dynamicSpikeCapped) "spike" else null,
+).joinToString(",").ifEmpty { "none" }
 
 /** Build a JSON blob suitable for embedding in NS deviceStatus from a [V5Decision]. */
 fun v5DecisionToRtJson(decision: V5Decision): JSONObject {
-    val gateReduction = listOfNotNull(
-        decision.phase3.reductions.iobHeadroomBrake.takeIf { it < 1.0 }?.let { "iobHeadroom:${formatScale(it)}" },
-        decision.phase3.reductions.postActionRiskCheck.takeIf { it < 1.0 }?.let { "postAction:${formatScale(it)}" },
-        decision.phase3.reductions.decelerationBrake.takeIf { it < 1.0 }?.let { "decel:${formatScale(it)}" },
-        decision.phase3.reductions.sensorQualityCheck.takeIf { it < 1.0 }?.let { "sensor:${formatScale(it)}" },
-        decision.phase3.reductions.hardGateFired?.let { "HARD:$it" },
-        if (decision.phase3.reductions.maxIobClampApplied) "maxIOB" else null,
-        if (decision.phase3.reductions.dynamicSpikeCapped) "spike" else null,
-    ).joinToString(",").ifEmpty { "none" }
+    val gateReduction = formatGateReduction(decision.phase3.reductions)
 
     return JSONObject()
         .put(V5RTFields.MEAL_SIGNAL_SCORE, round4(decision.score))
@@ -142,7 +163,7 @@ fun v5DecisionToRtJson(decision: V5Decision): JSONObject {
         .put(V5RTFields.MEAL_HYPOTHESIS_AGE, decision.mealHypothesisAge)
         .put(V5RTFields.AGGRESSION_BUDGET, round4(decision.aggressionBudget.budget))
         .put(V5RTFields.ACTION_MULTIPLIER, round4(decision.actionMultiplier))
-        .put(V5RTFields.GATE_REDUCTION_PCT, gateReduction)
+        .put(V5RTFields.GATE_REDUCTION, gateReduction)
 }
 
 /** Numeric rounding to 4 decimals — locale-independent (don't use String.format default locale). */

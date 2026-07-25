@@ -20,6 +20,7 @@ import app.aaps.core.graph.data.ScaledDataPoint
 import app.aaps.core.graph.data.TimeAsXAxisLabelFormatter
 import app.aaps.core.interfaces.overview.OverviewData
 import app.aaps.core.interfaces.profile.ProfileFunction
+import app.aaps.core.interfaces.profile.ProfileUtil
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.utils.Round
 import app.aaps.core.keys.UnitDoubleKey
@@ -44,7 +45,8 @@ import kotlin.math.max
  *  - In-range lower border: red  at 30 % opacity, dashed
  *  - Basal bars:            #fb923c at 35 % opacity (orange)
  *  - Now line:              white at 10 % opacity, dashed
- *  - Target line:           white at low opacity, thin
+ *  - Target line:           accent green #6ee7b7 at 50 % opacity
+ *  - TT deviation zones:    green/red tint between profile target and active target
  *  - IOB line:              #60a5fa (blue)
  *  - IOB fill:              #60a5fa at 40 % opacity
  *  - Grid lines:            #1a1d28
@@ -53,6 +55,7 @@ import kotlin.math.max
 @Suppress("UNCHECKED_CAST")
 class BoostV2GraphData @Inject constructor(
     private val profileFunction: ProfileFunction,
+    private val profileUtil: ProfileUtil,
     private val preferences: Preferences,
     private val rh: ResourceHelper
 ) {
@@ -74,8 +77,18 @@ class BoostV2GraphData @Inject constructor(
         /** Now line — white at 10 % opacity */
         val NOW_LINE = Color.argb(26, 255, 255, 255)
 
-        /** Target line — white at 15 % opacity */
-        val TARGET_LINE = Color.argb(38, 255, 255, 255)
+        /** Target line — V2 accent green #6ee7b7 at 50 % opacity.
+         *  Hierarchy: the target is the most visible reference line, the range borders come
+         *  next, and the now-line is the most subtle. Using a hue (not brighter white) keeps
+         *  it distinguishable from the white now-line and grid by colour, not just dash. */
+        val TARGET_LINE = Color.argb(128, 110, 231, 183)
+
+        /** Temp-target deviation zone, target RAISED above profile — accent-green tint.
+         *  Deliberately near IN_RANGE_FILL subtlety (alpha 12) — a tint, not a block. */
+        val TT_RAISED_ZONE_FILL = Color.argb(20, 110, 231, 183)
+
+        /** Temp-target deviation zone, target LOWERED below profile — red tint */
+        val TT_LOWERED_ZONE_FILL = Color.argb(20, 255, 82, 82)
 
         /** IOB line colour — blue #60a5fa */
         val IOB_LINE = Color.parseColor("#60a5fa")
@@ -338,14 +351,98 @@ class BoostV2GraphData @Inject constructor(
     }
 
     /**
-     * Target line with V2 styling: thin white at low opacity.
+     * Target line with V2 styling: accent green at 50 % opacity, thickness 2.
+     *
+     * Temp-target deviation zones are added first so the line draws on top of them.
      */
     fun addTargetLine() {
+        addTargetDeviationZones()
         (overviewData.temporaryTargetSeries as LineGraphSeries<DataPoint>).also {
             it.color = TARGET_LINE
-            it.thickness = 1
+            it.thickness = 2
         }
         addSeries(overviewData.temporaryTargetSeries as LineGraphSeries<DataPoint>)
+    }
+
+    /**
+     * Translucent zones for every interval where the active target deviates from the
+     * profile default target — makes overrides (exercise 150, lowered targets) visible
+     * at a glance. Green tint when the target is raised, red tint when lowered.
+     *
+     * Interval source: [OverviewData.temporaryTargetSeries] is a step line built by
+     * PrepareTemporaryTargetDataWorker at 5-min resolution — consecutive points with the
+     * same y form horizontal intervals of constant active target. We iterate those points
+     * directly and compare against the profile default target, mirroring the worker's
+     * unit conversion exactly:
+     *   series y  = profileUtil.fromMgdlToUnits(target mg/dL)          → display units
+     *   default   = profileUtil.fromMgdlToUnits((lowMgdl+highMgdl)/2)  → display units
+     * so both sides of the comparison are in the user's display units (mgdl or mmol).
+     *
+     * Like [addInRangeArea], this never touches maxY/minY — the bands sit between two
+     * target values that are already well inside the BG axis range.
+     */
+    private fun addTargetDeviationZones() {
+        val targetSeries = overviewData.temporaryTargetSeries as LineGraphSeries<DataPoint>
+        if (targetSeries.isEmpty) return
+        val profile = profileFunction.getProfile() ?: return
+
+        // Epsilon ≈ 1 mg/dL expressed in display units (≈ 0.056 mmol/L)
+        val epsilon = profileUtil.fromMgdlToUnits(1.0)
+        // Same sampling cadence the series was built with — catches profile-target
+        // schedule steps that occur inside a single temp-target interval.
+        val sampleMs = 5 * 60 * 1000.0
+
+        val points = ArrayList<DataPoint>()
+        val iterator = targetSeries.getValues(targetSeries.lowestValueX, targetSeries.highestValueX)
+        while (iterator.hasNext()) points.add(iterator.next())
+        if (points.size < 2) return
+
+        var bandOpen = false
+        var bandStartX = 0.0
+        var bandActive = 0.0
+        var bandDefault = 0.0
+
+        fun closeBand(endX: Double) {
+            if (!bandOpen) return
+            bandOpen = false
+            if (endX <= bandStartX) return
+            val lo = minOf(bandActive, bandDefault)
+            val hi = maxOf(bandActive, bandDefault)
+            val fill = if (bandActive > bandDefault) TT_RAISED_ZONE_FILL else TT_LOWERED_ZONE_FILL
+            addSeries(AreaGraphSeries(arrayOf(
+                DoubleDataPoint(bandStartX, lo, hi),
+                DoubleDataPoint(endX, lo, hi)
+            )).also { s ->
+                s.color = 0 // no outline — fill only (same pattern as the in-range band)
+                s.isDrawBackground = true
+                s.backgroundColor = fill
+            })
+        }
+
+        for (i in 0 until points.size - 1) {
+            val a = points[i]
+            val b = points[i + 1]
+            // Vertical step edges (same x or different y) are not intervals
+            if (a.y != b.y || b.x <= a.x) continue
+            val active = a.y
+            var t = a.x
+            while (t < b.x) {
+                val defaultTarget = profileUtil.fromMgdlToUnits(
+                    (profile.getTargetLowMgdl(t.toLong()) + profile.getTargetHighMgdl(t.toLong())) / 2.0
+                )
+                val deviates = abs(active - defaultTarget) > epsilon
+                // Close the running band on any change of deviation state or band geometry
+                if (bandOpen && (!deviates || active != bandActive || defaultTarget != bandDefault)) closeBand(t)
+                if (deviates && !bandOpen) {
+                    bandOpen = true
+                    bandStartX = t
+                    bandActive = active
+                    bandDefault = defaultTarget
+                }
+                t += sampleMs
+            }
+        }
+        closeBand(points[points.size - 1].x)
     }
 
     /**

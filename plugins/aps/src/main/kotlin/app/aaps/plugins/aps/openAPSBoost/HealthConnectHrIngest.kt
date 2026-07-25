@@ -14,6 +14,7 @@ import app.aaps.core.keys.BooleanKey
 import app.aaps.core.keys.IntKey
 import app.aaps.core.keys.LongNonKey
 import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.plugins.aps.getBoostDosing
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -93,8 +94,10 @@ class HealthConnectHrIngest @Inject constructor(
      * async sync when due. Never throws.
      */
     fun syncIfDue() {
-        if (!preferences.get(BooleanKey.ApsBoostHealthConnectHrEnabled)) return
-        val intervalMs = preferences.get(IntKey.ApsBoostHealthConnectPollMin).coerceAtLeast(1) * 60_000L
+        // 2026-07-08: raw reads — Simple Mode must NOT mask HC-HR enable back to its `false` default
+        // (that silently starves HR ingest — another overnight-HR-loss vector) nor reset the poll interval.
+        if (!preferences.getBoostDosing(BooleanKey.ApsBoostHealthConnectHrEnabled)) return
+        val intervalMs = preferences.getBoostDosing(IntKey.ApsBoostHealthConnectPollMin).coerceAtLeast(1) * 60_000L
         val now = System.currentTimeMillis()
         if (now - lastSyncRunMs < intervalMs) return
         if (!inFlight.compareAndSet(false, true)) return   // atomic guard — no check-then-act race

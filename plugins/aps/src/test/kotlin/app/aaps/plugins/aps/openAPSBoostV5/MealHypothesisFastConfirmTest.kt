@@ -5,9 +5,11 @@ import org.junit.jupiter.api.Test
 
 /**
  * 2026-06-16 fast-carb fast-path. Single-cycle OBSERVING/IDLE → CONFIRMED when the rise is sharp
- * (delta ≥ 8) AND accelerating (deltaAccl ≥ 15) AND score corroborates (≥ 0.60) AND awake AND not
- * exercising AND the toggle is on — replay-validated to recover the ~15-min confirm latency that
- * crashed the 2026-06-16 fast carb, without firing on sleep/compression. Pure-function tests on step().
+ * (delta ≥ FAST_CONFIRM_DELTA) AND accelerating (deltaAccl ≥ FAST_CONFIRM_ACCL) AND score
+ * corroborates (≥ FAST_CONFIRM_SCORE) AND awake AND not exercising AND the toggle is on —
+ * replay-validated to recover the ~15-min confirm latency that crashed the 2026-06-16 fast carb,
+ * without firing on sleep/compression. Retuned 2026-07-03 (Δ 8→6, accl 15→10, score 0.60→0.65 —
+ * see MealHypothesis.kt). Pure-function tests on step().
  */
 class MealHypothesisFastConfirmTest {
 
@@ -72,5 +74,30 @@ class MealHypothesisFastConfirmTest {
         // Existing call sites that don't pass the new args must behave exactly as before.
         val r = step(idle(), score = 0.5, eventualBg = 150.0, targetBg = 100.0, delta = D, deltaAccl = A, deltaDeclining = false)
         assertThat(r.state).isEqualTo(MealHypothesis.OBSERVING)   // score≥ENTER_OBSERVING → OBSERVING, not fast-confirm
+    }
+
+    // ── 2026-07-02 post-hypo rescue-carb guard (fastConfirmAllowed) ──────────────────────────
+
+    @Test fun `rescue guard suppresses the fast path within an hour of a hypo`() {
+        // 60-min low 55 (rescue-carb rebound): guard off → step must NOT fast-confirm
+        assertThat(fastConfirmAllowed(fastCarbConfirmEnabled = true, recentLowBg = 55.0)).isFalse()
+        val r = step(idle(), S, 150.0, 100.0, D, A, false, asleep = false, exerciseActive = false,
+            fastConfirmEnabled = fastConfirmAllowed(true, 55.0))
+        assertThat(r.state).isNotEqualTo(MealHypothesis.CONFIRMED)
+    }
+
+    @Test fun `rescue guard boundary - exactly 80 allows, just below blocks`() {
+        assertThat(fastConfirmAllowed(true, FAST_CONFIRM_MIN_RECENT_LOW_MGDL)).isTrue()
+        assertThat(fastConfirmAllowed(true, FAST_CONFIRM_MIN_RECENT_LOW_MGDL - 0.1)).isFalse()
+    }
+
+    @Test fun `rescue guard passes through a disabled toggle`() {
+        assertThat(fastConfirmAllowed(fastCarbConfirmEnabled = false, recentLowBg = 150.0)).isFalse()
+    }
+
+    @Test fun `no recent low - fast path fires as before`() {
+        val r = step(idle(), S, 150.0, 100.0, D, A, false, asleep = false, exerciseActive = false,
+            fastConfirmEnabled = fastConfirmAllowed(true, 110.0))
+        assertThat(r.state).isEqualTo(MealHypothesis.CONFIRMED)
     }
 }

@@ -73,3 +73,57 @@ object HrSourceResolver {
         return Resolution(active?.source, active != null, note, states)
     }
 }
+
+/**
+ * HrFeedDarkTracker — HR silent-death edge detection (F4 phone side, 2026-07-07).
+ *
+ * [HrSourceResolver] made the live HR source VISIBLE per cycle, but nothing marked the moment the
+ * whole feed died: `anyFresh` just flipped false and stayed there, indistinguishable in the reason
+ * log from "was never connected". This tracker edge-detects the fresh→dark transition (one
+ * reason-line note naming the last-alive device and its age) and, after [notifyAfterMin]
+ * consecutive dark minutes during waking hours ([notifyFromHour]..[notifyUntilHour]), asks for a
+ * single low-priority AAPS notification per dark episode — night outages (charging the watch)
+ * don't nag, a daytime dead feed does, exactly once.
+ *
+ * State machine only; the caller does the logging/notifying. One instance per plugin (state must
+ * persist across cycles).
+ */
+class HrFeedDarkTracker(
+    private val notifyAfterMin: Long = 60,
+    private val notifyFromHour: Int = 8,
+    private val notifyUntilHour: Int = 22,
+) {
+
+    @Volatile private var wasFresh: Boolean? = null   // null = unknown (process start)
+    @Volatile private var darkSinceMs: Long = 0L
+    @Volatile private var notified = false
+
+    /**
+     * @param wentDarkNote non-null exactly on the fresh→dark edge — reason-line/log text.
+     * @param raiseNotification true exactly once per dark episode when the waking-hours
+     *        threshold is crossed.
+     * @param darkMinutes consecutive dark minutes so far (0 while fresh).
+     */
+    data class Event(val wentDarkNote: String?, val raiseNotification: Boolean, val darkMinutes: Long)
+
+    fun onCycle(res: HrSourceResolver.Resolution, nowMs: Long, localHour: Int): Event {
+        if (res.anyFresh) {
+            wasFresh = true
+            darkSinceMs = 0L
+            notified = false
+            return Event(null, false, 0)
+        }
+        val edged = wasFresh == true                  // only a genuine true→false transition notes
+        wasFresh = false
+        if (darkSinceMs == 0L) darkSinceMs = nowMs
+        val darkMinutes = (nowMs - darkSinceMs) / 60_000L
+        val note = if (edged) {
+            val last = res.states.minByOrNull { it.ageMs }
+            if (last != null) "HR feed went dark (last ${last.source} ${last.ageMs / 60_000L}m ago)"
+            else "HR feed went dark (no readings in window)"
+        } else null
+        val raise = !notified && darkMinutes >= notifyAfterMin && localHour in notifyFromHour until notifyUntilHour
+        if (raise) notified = true
+        return Event(note, raise, darkMinutes)
+    }
+}

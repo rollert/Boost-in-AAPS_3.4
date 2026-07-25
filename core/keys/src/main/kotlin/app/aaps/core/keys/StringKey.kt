@@ -96,4 +96,11 @@ enum class StringKey(
     // Activity-load SHADOW (2026-06-16) — JSON of single-source per-day step totals (rolling 28d).
     // Drives the personal step baseline; the activity/inactivity ISF factors are LOGGED ONLY (shadow).
     ApsBoostDailyStepHistory("boost_daily_step_history", "", defaultedBySM = true),
+
+    // Intraday step bank (2026-07-07) — JSON {d: dayIndex, max: {source: count}} of per-source
+    // running maxima of today's cumulative steps. Day-close resolves the completed day from this
+    // BANK, never from post-reset live reads (the wear counter resets at DEVICE midnight before
+    // the phone-local rollover — the 07-06 5.6x undercount). Persisted so a mid-evening app
+    // restart keeps the day's peak. Empty/corrupt -> fresh bank (one day's history at risk, safe).
+    ApsBoostIntradayStepBank("boost_intraday_step_bank", "", defaultedBySM = true),
 }

@@ -9,6 +9,13 @@
 > (see the README's auto-configuration section); this page documents the underlying V1/V2
 > plugins that V6 still runs on top of and derives its starting defaults from.
 
+> ⚠️ **LEGACY REFERENCE — V2 / v4.2 etc. are retired and no longer selectable.** Only **"Boost"**
+> (the base engine) and **"Boost V6"** now appear in the APS plugin list. The intermediate plugins
+> (V2, V3, v4.4/v4.4.2 — the doc calls the last of these "v4.2") are hidden and cannot be chosen as
+> your active APS. Any instruction below to *"select it as the active APS"* is **historical** and no
+> longer possible; those plugins' behaviour has been folded into Boost V6. Keep reading for the
+> settings *concepts* (DynISF formulae, tiers, night mode), not the plugin-selection steps.
+
 ---
 
 This documentation adds two experimental features on top of the dev branch:
@@ -285,7 +292,7 @@ Because TDD is squared in the V2 formula, ISF is **much more responsive to TDD c
 
 * V2 will self-adjust more aggressively as your TDD changes day to day.
 * It is strongly recommended to **log-compare V1 and V2 output side by side** before running V2 live.
-* TDD data is mandatory for. If TDD data is incomplete, ISF falls back to your profile ISF.
+* TDD data is mandatory for the V2 formula. If TDD data is incomplete, ISF falls back to your profile ISF.
 * **Start with an adjustment factor of 100%** and adjust from there.
 
 ---
@@ -352,7 +359,7 @@ If your control is generally stable and you're not experiencing rollercoaster pa
 
 Boost v4.2 extends V3 with two features: an on-device ML hypo risk model and a deviation-based sensitivity model. Everything else — the DynISF formula, the 8-tier SMB decision tree, TDD selection, exercise handling — is inherited from V3.
 
-**To use v4.2, select it as the active APS plugin in Config Builder.** It appears as a separate entry from Boost V3. If you have Boost V3 selected, the ML model and deviation sensitivity will not be active.
+**Historical (no longer possible):** v4.2 was once selected as its own active APS plugin in Config Builder, appearing as a separate entry from Boost V3. It is now **retired and hidden** — it does not appear in the APS list and cannot be selected. Its ML hypo-risk model has been folded into the current **Boost V6** engine (see the [main README](../README.md)); the description below is kept for reference only.
 
 ### On-device ML hypo risk model
 
@@ -707,7 +714,7 @@ There is a setting in both the **Boost and Boost V2** preferences called **"Allo
 
 ## Running V1 and V2 side by side
 
-Boost V2 is registered as a separate plugin in AAPS. You can switch between Boost and Boost V2 in the Config Builder. Only one can be active at a time, but both are available for selection.
+**Historical (no longer possible):** Boost V2 was once registered as a separate, selectable plugin in AAPS, and you could switch between Boost and Boost V2 in the Config Builder. Boost V2 is now **retired and hidden** — it no longer appears in the APS list, so only **Boost** (base) and **Boost V6** can be selected. The comparison notes below are kept for historical reference.
 
 > ⚠️ **Do not use Boost V2 for live dosing.** It is currently available for parallel observation only — run it on a development or secondary phone alongside Boost to compare log outputs. Do not make it your active plugin until it has been explicitly cleared for live use.
 

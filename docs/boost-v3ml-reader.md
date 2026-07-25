@@ -1,5 +1,13 @@
 # Boost V3ML
 
+> ⚠️ **HISTORICAL — describes an early-2026 branch state; superseded by Boost V6.** When this was
+> written the ML hypo-risk model and V3ML plugin were experimental and *not* in the mainline branch.
+> That is no longer true: the **ML hypo-risk model is now live inside the current Boost V6 engine**
+> (`BoostRiskModel.kt`), and the standalone V3ML plugin (`openAPSBoostV3ML`, shown in the app as
+> "Boost v4.4") has been **retired and hidden** — it is no longer selectable. Read this only for the
+> history of how the ML model was built and validated; for current behaviour start at the
+> [main README](../README.md).
+
 ## What V3ML is
 
 V3ML is an experimental branch of Boost V3 that adds two features to the base V3 algorithm: an on-device ML hypo risk model that modulates SMB delivery, and a deviation-based sensitivity model that adjusts ISF, basal, and BG targets in real time. Everything else — the DynISF formula, the 8-tier SMB decision tree, TDD selection, exercise handling — is inherited from V3.

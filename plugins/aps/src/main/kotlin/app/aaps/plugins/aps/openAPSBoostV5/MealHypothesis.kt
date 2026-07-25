@@ -102,9 +102,75 @@ data class MealHypothesisState(
 internal const val ENTER_OBSERVING_SCORE = 0.44                 // calibrated: 0.40 → 0.44
 internal const val CONFIRM_SCORE = 0.55                         // 2026-05-15: 0.66 → 0.55 (was at p99 of observed scores; lowered with peak-score tracking)
 internal const val CONFIRM_EVENTUAL_BG_OFFSET_MGDL = 30.0       // 2026-05-22: 50.0 → 30.0 (Fix 5 — paired with peak-offset tracking)
-internal const val CONFIRM_MIN_OBSERVING_AGE = 2                // hysteresis: must observe ≥2 cycles before confirming
+internal const val CONFIRM_MIN_OBSERVING_AGE = 2                // hysteresis: age enters OBSERVING at 0 and increments post-check, so confirm is first possible on the 4th OBSERVING cycle (age ≥ 2 checked on the 3rd increment)
+
+/**
+ * 2026-07-03 sustained-score early confirm: OBSERVING → CONFIRMED may fire before
+ * [CONFIRM_MIN_OBSERVING_AGE] when the INSTANTANEOUS score has been ≥ [CONFIRM_SCORE] on BOTH
+ * this cycle and the immediately preceding one (`scoreReadyStreak` — supplied by the caller,
+ * same cross-cycle-input pattern as `deltaDeclining`). All other confirm conditions (peak
+ * eventualBG offset ≥ 30, confirmDoseAdequate, !committedInSession) are unchanged.
+ *
+ * WHY: replay vs the cohort DB (2026-07-03) showed 53% of confirm latency was purely
+ * mechanical — the score was already ≥ CONFIRM_SCORE for ≥2 cycles before the age gate
+ * opened. Shifting the SAME commit-shot 1 cycle earlier measured 0.0pp additional pre-low
+ * exposure, vs +14–17% for added-insulin levers evaluated in the same sweep. The early path
+ * requires the CURRENT score ≥ threshold (not just the tracked max) because the whole point
+ * is a sustained-ready score, not a transient peak.
+ *
+ * This is the DEFAULT early path (the early-dosing audit priced the `- 1` step at 0.0pp harm).
+ */
+internal const val CONFIRM_MIN_OBSERVING_AGE_SCORE_READY = CONFIRM_MIN_OBSERVING_AGE - 1
+
+/**
+ * 2026-07-17 (user H "confirm sooner") — AGGRESSIVE early confirm, one cycle earlier again
+ * (`- 2` = 0), so a meal whose score is confirm-strength on two consecutive cycles confirms as
+ * soon as it enters OBSERVING. Still MOVES the same commit-shot (no added insulin) with the
+ * scoreReadyStreak protection, BUT the pre-push backtest showed ~28% of its candidates are
+ * fizzle-catches (episodes that would have fallen back to IDLE) = new insulin at ~base rate — so
+ * it is NOT a clean cohort default. It is therefore OPT-IN and AUTO-CONFIG MANAGED
+ * (BooleanKey.ApsBoostV5AggressiveEarlyConfirm, enabled by BoostV5AutoConfig ONLY for clearly
+ * well-controlled users — the same class the fastCarbConfirm derivation gates). Threaded via the
+ * `aggressiveEarlyConfirm` flag; false (default) keeps the audit-validated `- 1` timing.
+ * See backtesting/scripts/2026-07-userh-levers/.
+ */
+internal const val CONFIRM_MIN_OBSERVING_AGE_SCORE_READY_AGGRESSIVE = CONFIRM_MIN_OBSERVING_AGE - 2
+// 2026-07-02 dose-adequacy gate: the confirm floor is committedCapU, clamped to at most this fraction
+// of confirmedCapU so a manual committedCap ≥ confirmedCap can't make the gate unsatisfiable (which
+// would silently disable V6's meal response). See DetermineBasalBoostV5.decide().
+internal const val CONFIRM_DOSE_FLOOR_MAX_FRAC_OF_CONFIRMED_CAP = 0.8
+
+/**
+ * 2026-07-06 confirm-floor pin: the committedCapU term of the confirm dose floor is pinned at
+ * the FACTORY default COMMITTED cap (0.5 U — `DoubleKey.ApsBoostV5CommittedCapU` default),
+ * regardless of the live preference value.
+ *
+ * The floor's job is "the commit-shot must beat one ROUTINE hold". A user-RAISED committedCap
+ * describes a bigger PERMITTED hold, not a bigger routine one — so it must not move the floor.
+ * Without the pin, raising committedCap silently TIGHTENS the confirm gate: the 2026-07-06
+ * backtest on live telemetry showed a 0.5 → 1.0 cap raise would newly block ~18% of confirms
+ * (prospective shots ≤ 1.0 U) — exactly the mid-meal starvation the gate exists to prevent.
+ * A user-LOWERED committedCap still lowers the floor (min semantics preserved — see
+ * [confirmDoseFloorU]).
+ */
+internal const val CONFIRM_FLOOR_COMMITTED_TERM_MAX = 0.5
+
+/**
+ * The OBSERVING→CONFIRMED dose-adequacy floor (U):
+ * `min(min(committedCapU, CONFIRM_FLOOR_COMMITTED_TERM_MAX), 0.8 × confirmedCapU)`.
+ *
+ * The committedCap term is pinned at the factory default ([CONFIRM_FLOOR_COMMITTED_TERM_MAX])
+ * so raising the COMMITTED cap can't tighten the confirm gate (2026-07-06 — see the pin KDoc);
+ * lowering it below the pin still lowers the floor. The confirmedCap clamp
+ * ([CONFIRM_DOSE_FLOOR_MAX_FRAC_OF_CONFIRMED_CAP], 2026-07-02) keeps the gate satisfiable.
+ */
+internal fun confirmDoseFloorU(committedCapU: Double, confirmedCapU: Double): Double =
+    minOf(
+        minOf(committedCapU, CONFIRM_FLOOR_COMMITTED_TERM_MAX),
+        CONFIRM_DOSE_FLOOR_MAX_FRAC_OF_CONFIRMED_CAP * confirmedCapU,
+    )
 internal const val FALL_BACK_TO_IDLE_SCORE = 0.36               // calibrated: 0.30 → 0.36
-internal const val FALL_BACK_TO_IDLE_AGE = 2                    // hysteresis: ≥2 cycles below threshold to fall back
+internal const val FALL_BACK_TO_IDLE_AGE = 2                    // hysteresis: falls back when TOTAL OBSERVING age ≥ 2 AND the CURRENT cycle is below threshold (not "2 consecutive below" — one sub-threshold blip after age 2 exits)
 internal const val CONFIRMED_TO_COMMITTED_AGE = 0               // 2026-05-26 Fix 6: 1 → 0 (true single-cycle commit; previously CONFIRMED stayed for 2 invokes due to age semantics, allowing 2× CONFIRMED-mult doses)
 internal const val RECOVERING_DECEL_THRESHOLD = -5.0            // delta_accl < -5 enters RECOVERING (with delta declining)
 internal const val RECOVERING_TO_IDLE_SCORE = 0.18              // calibrated: 0.20 → 0.18
@@ -129,12 +195,71 @@ internal const val RECOVERING_REENGAGE_MIN_AGE = 1          // ≥1 cycle in REC
 // ~⅓ of meals ~15 min earlier with ZERO sleep-fires and ~1 false fire/day; the raw delta+accl
 // rule (no score/awake gate) fired during sleep (compression risk) and ~2×/day falsely.
 // Still respects the Fix-6 single-CONFIRMED-per-session guard (committedInSession).
-internal const val FAST_CONFIRM_DELTA = 8.0                    // mg/dL per 5 min — sharp rise
-internal const val FAST_CONFIRM_ACCL = 15.0                    // delta_accl % — accelerating
-internal const val FAST_CONFIRM_SCORE = 0.60                   // meal score must corroborate (> ENTER_OBSERVING 0.44)
+//
+// 2026-07-03 retune (replay sweep over the cohort): Δ 8→6, accl 15→10, score 0.60→0.65. This
+// point catches +21 meals ~9 min earlier while REDUCING false fires 39%→32% — the score raise
+// pays for the physics relaxation. A plain physics relaxation WITHOUT the score raise is worse
+// (40% false); the tighter score gate is what makes the looser Δ/accl thresholds safe. All
+// guards (awake, not exercising, recentLowBg ≥ 80, !committedInSession, pref toggle) unchanged.
+internal const val FAST_CONFIRM_DELTA = 6.0                    // mg/dL per 5 min — sharp rise (2026-07-03: 8.0 → 6.0)
+internal const val FAST_CONFIRM_ACCL = 10.0                    // delta_accl % — accelerating (2026-07-03: 15.0 → 10.0)
+internal const val FAST_CONFIRM_SCORE = 0.65                   // meal score must corroborate (2026-07-03: 0.60 → 0.65; > ENTER_OBSERVING 0.44)
+// 2026-07-02 post-hypo rescue-carb guard: the fast path is suppressed when the 60-min BG low is
+// below this. A rescue-carb rebound routinely satisfies the fast-path Δ/accl/score thresholds, and the
+// fast path is EXEMPT from the confirmDoseAdequate gate — so it was the only unguarded CONFIRMED
+// entry within an hour of a hypo. Replay over 613 real fast-path firings (7 users, May–Jul):
+// threshold 80 blocks 36% of firings, 47 of which preceded a SECOND low <70 within 2h; the rest
+// are rebound-shaped meals whose confirm arrives ~2 cycles later via the normal path (V1 base
+// dosing continues meanwhile). 100 over-blocked (63%, normal pre-meal dips); 80→90 marginal trade
+// is poor (8 more catches for 80 more blocks). See v6-safety-review-2026-07-02.
+internal const val FAST_CONFIRM_MIN_RECENT_LOW_MGDL = 80.0
+
+/**
+ * Effective fast-carb fast-path enable for this cycle: the user toggle AND the post-hypo
+ * rescue-carb guard ([FAST_CONFIRM_MIN_RECENT_LOW_MGDL]). Computed by the caller (decide())
+ * and passed to [step] as `fastConfirmEnabled` — same pattern as `confirmDoseAdequate`.
+ */
+fun fastConfirmAllowed(fastCarbConfirmEnabled: Boolean, recentLowBg: Double): Boolean =
+    fastCarbConfirmEnabled && recentLowBg >= FAST_CONFIRM_MIN_RECENT_LOW_MGDL
 
 /** Time-jump threshold (minutes) for forcing IDLE on clock changes (e.g. timezone switch). */
 internal const val TIME_JUMP_RESET_MINUTES = 30.0
+
+/**
+ * OBSERVING → CONFIRMED eligibility EXCLUDING the dose-adequacy gate — the exact sub-conditions
+ * [step]'s OBSERVING branch checks (age gate incl. the 2026-07-03 sustained-score early path,
+ * peak score, peak eventualBG offset, single-confirm-per-session lock), minus confirmDoseAdequate.
+ *
+ * Exposed for gate telemetry (`boostV5_confirmGate`, 2026-07-03): decide() labels each cycle
+ * "pass" / "blocked" / "n/a" so a dose-adequacy gate block is distinguishable from a score fade
+ * in NS — needed for the 2026-07-10 live gate review. [step] calls this SAME function for its
+ * dosing decision, so the telemetry and dosing predicates can never diverge.
+ */
+fun confirmEligibleExceptDoseGate(
+    current: MealHypothesisState,
+    score: Double,
+    eventualBg: Double,
+    targetBg: Double,
+    scoreReadyStreak: Boolean = false,
+    // 2026-07-17: when true, the sustained-score early path opens ONE cycle earlier again (age −2
+    // instead of −1). Opt-in + auto-config managed — see CONFIRM_MIN_OBSERVING_AGE_SCORE_READY_AGGRESSIVE.
+    aggressiveEarlyConfirm: Boolean = false,
+): Boolean {
+    if (current.state != MealHypothesis.OBSERVING || current.committedInSession) return false
+    val newMaxScore = max(current.maxScoreInObserving, score)
+    val newMaxOffset = max(current.maxEventualBgOffsetInObserving, eventualBg - targetBg)
+    val age = current.ageCycles
+    // 2026-07-03: age gate opens one cycle early when the score has been ≥ CONFIRM_SCORE on BOTH
+    // this cycle and the previous one (see CONFIRM_MIN_OBSERVING_AGE_SCORE_READY). The early path
+    // checks the CURRENT score, not the tracked max — a sustained-ready score, not a transient
+    // peak, is what justifies shaving the hysteresis. 2026-07-17: the aggressive opt-in shaves one
+    // more cycle (age −2).
+    val scoreReadyFloor = if (aggressiveEarlyConfirm) CONFIRM_MIN_OBSERVING_AGE_SCORE_READY_AGGRESSIVE
+    else CONFIRM_MIN_OBSERVING_AGE_SCORE_READY
+    val ageEligible = age >= CONFIRM_MIN_OBSERVING_AGE ||
+        (age >= scoreReadyFloor && score >= CONFIRM_SCORE && scoreReadyStreak)
+    return ageEligible && newMaxScore >= CONFIRM_SCORE && newMaxOffset >= CONFIRM_EVENTUAL_BG_OFFSET_MGDL
+}
 
 /**
  * Single-step transition. Pure function; no side effects. Caller threads state across cycles.
@@ -160,6 +285,19 @@ fun step(
     asleep: Boolean = false,
     exerciseActive: Boolean = false,
     fastConfirmEnabled: Boolean = false,
+    // 2026-07-02: OBSERVING→CONFIRMED dose-adequacy gate. Caller sets it true when the prospective
+    // commit-shot (budget × CONFIRMED mult) exceeds one routine COMMITTED hold (committedCapU, clamped
+    // < confirmedCapU). Defaults true so the fast-carb path and existing callers/tests are unaffected.
+    confirmDoseAdequate: Boolean = true,
+    // 2026-07-03: sustained-score early confirm. True when the PREVIOUS cycle's score was already
+    // ≥ CONFIRM_SCORE — computed by the caller from last cycle's score (cross-cycle input, same
+    // pattern as deltaDeclining). With the CURRENT score also ≥ CONFIRM_SCORE, the age gate opens
+    // one cycle early (CONFIRM_MIN_OBSERVING_AGE_SCORE_READY). Defaults false = legacy timing for
+    // all existing callers/tests.
+    scoreReadyStreak: Boolean = false,
+    // 2026-07-17: aggressive early-confirm opt-in (auto-config managed). Shaves the score-ready path
+    // one more cycle (age −2). Defaults false = the audit-validated −1 timing for existing callers/tests.
+    aggressiveEarlyConfirm: Boolean = false,
 ): MealHypothesisState {
     val state = current.state
     val age = current.ageCycles
@@ -201,10 +339,11 @@ fun step(
             // shadow dose; this guard caps it to a single commit-shot per meal session.
             val newMaxScore = max(maxScore, score)
             val newMaxOffset = max(maxOffset, currentOffset)
-            val confirmEligible = age >= CONFIRM_MIN_OBSERVING_AGE &&
-                newMaxScore >= CONFIRM_SCORE &&
-                newMaxOffset >= CONFIRM_EVENTUAL_BG_OFFSET_MGDL &&
-                !committedInSession
+            // Eligibility sub-conditions (age gate incl. the 2026-07-03 sustained-score early path,
+            // peak score, peak offset, session lock) live in confirmEligibleExceptDoseGate — shared
+            // with decide()'s boostV5_confirmGate telemetry so the two can never diverge (2026-07-03).
+            val confirmEligible = confirmEligibleExceptDoseGate(current, score, eventualBg, targetBg, scoreReadyStreak, aggressiveEarlyConfirm) &&
+                confirmDoseAdequate   // 2026-07-02: don't spend the token on a shot < one COMMITTED hold
             when {
                 // Fast-carb fast-path: confirm in a single OBSERVING cycle, bypassing the age +
                 // eventualBg-offset gates, but still honouring the Fix-6 single-confirm guard.

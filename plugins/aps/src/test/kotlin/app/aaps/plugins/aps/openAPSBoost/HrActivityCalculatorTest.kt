@@ -250,6 +250,43 @@ class HrActivityCalculatorTest {
         assertThat(result.confidence).isEqualTo(HrActivityCalculator.Confidence.MEDIUM)
     }
 
+    @Test fun `classify - a frozen HR value (4 or more identical readings) is treated as unavailable`() {
+        // 5 bit-identical elevated readings = a stuck sensor value, not a heartbeat. Without the
+        // guard this classifies as RESISTANCE (zone3+, low steps) — the exact false-fire seen with a
+        // value pinned at 124 bpm all night. The guard rejects it and falls back to step-only.
+        val result = HrActivityCalculator.classify(
+            hrReadings = makeReadings(124.0, count = 5),
+            nowMillis = NOW,
+            hrWindowMinutes = WINDOW_MIN,
+            hrMax = 180,
+            hrResting = 60,
+            stepsLast15Min = 5,
+            stressDetection = false
+        )
+        assertThat(result.exerciseState).isEqualTo(HrActivityCalculator.ExerciseState.RESTING)
+        assertThat(result.averageHrBpm).isNull()
+        assertThat(result.hrZone).isEqualTo(HrActivityCalculator.HrZone.NONE)
+    }
+
+    @Test fun `classify - varying elevated HR is not frozen and still classifies`() {
+        // 5 readings that VARY around 140 bpm (a real elevated HR) with low steps must still reach
+        // RESISTANCE — the guard rejects stuck values, not genuinely elevated ones.
+        val readings = listOf(138.0, 141.0, 139.0, 142.0, 140.0).mapIndexed { i, bpm ->
+            HR(duration = 60_000L, timestamp = NOW - (i + 1) * 60_000L, beatsPerMinute = bpm, device = "test", isValid = true)
+        }
+        val result = HrActivityCalculator.classify(
+            hrReadings = readings,
+            nowMillis = NOW,
+            hrWindowMinutes = WINDOW_MIN,
+            hrMax = 180,
+            hrResting = 60,
+            stepsLast15Min = 10,
+            stressDetection = false
+        )
+        assertThat(result.exerciseState).isEqualTo(HrActivityCalculator.ExerciseState.RESISTANCE)
+        assertThat(result.averageHrBpm).isNotNull()
+    }
+
     @Test fun `classify - STRESS low steps zone 2-3 with stressDetection true`() {
         // 100 bpm: HRR% = (100-60)/120*100 = 33.3% → ZONE_2; steps=5
         val result = HrActivityCalculator.classify(
@@ -293,25 +330,53 @@ class HrActivityCalculatorTest {
     }
 
     @Test fun `classify - RESTING default fallback`() {
-        // 120 bpm: HRR% = (120-60)/120*100 = 50% → ZONE_3; steps=200 = moderate
-        // moderateSteps=true, zone>=ZONE_2 → MODERATE_AEROBIC (not RESTING)
-        // To get RESTING: need a case that falls through all other branches.
-        // Try high steps but very low zone (contradictory) — not covered by any specific branch:
-        // steps=200 (moderate), zone=ZONE_1 (25% HRR, bpm=90): !lowSteps && zone<=ZONE_2 → LIGHT_AEROBIC
-        // Try steps=50 (not low), zone=ZONE_3: !lowSteps && zone<=ZONE_2 is false, but lowSteps is also false
-        //   → falls to else → RESTING
+        // A case that falls through every specific branch to the else → RESTING:
+        // 100 bpm = 33% HRR → ZONE_2; steps=10 = lowSteps; stressDetection=false.
+        //   highSteps? no · moderateSteps? no · (!lowSteps && zone<=2)? lowSteps=true, no ·
+        //   (!moderateSteps && zone 3-4)? zone2, no · STRESS? stressDetection off, no ·
+        //   (lowSteps && zone1)? zone2, no  → else → RESTING.
         val result = HrActivityCalculator.classify(
-            hrReadings = makeReadings(115.0), // ZONE_3 ~46% HRR
+            hrReadings = makeReadings(100.0),
             nowMillis = NOW,
             hrWindowMinutes = WINDOW_MIN,
             hrMax = 180,
             hrResting = 60,
-            stepsLast15Min = 50,  // not low (>=30), not moderate (<100)
+            stepsLast15Min = 10,
             stressDetection = false
         )
-        // !lowSteps=true, zone=ZONE_3 > ZONE_2, so !lowSteps && zone<=ZONE_2 is false
-        // lowSteps=false so RESISTANCE branch fails; falls to else → RESTING
         assertThat(result.exerciseState).isEqualTo(HrActivityCalculator.ExerciseState.RESTING)
+    }
+
+    @Test fun `classify - DEAD ZONE fix - 30-99 steps with zone 3 HR is RESISTANCE not RESTING`() {
+        // 2026-07-21 regression guard for the incident: 64 steps (between LOW=30 and MODERATE=100) with
+        // a zone-3 HR previously matched NO branch and fell through to RESTING, so the inactivity branch
+        // then ADDED insulin during exercise. The widened RESISTANCE branch (!moderateSteps, zone 3-4)
+        // must now catch it. 104 bpm = (104-60)/120 = 36.7%... use 108 bpm → 40% → exactly ZONE_3.
+        val result = HrActivityCalculator.classify(
+            hrReadings = makeReadings(110.0), // (110-60)/120 = 41.7% → ZONE_3
+            nowMillis = NOW,
+            hrWindowMinutes = WINDOW_MIN,
+            hrMax = 180,
+            hrResting = 60,
+            stepsLast15Min = 64,  // the incident value — was a dead zone (30 <= 64 < 100)
+            stressDetection = false
+        )
+        assertThat(result.exerciseState).isEqualTo(HrActivityCalculator.ExerciseState.RESISTANCE)
+    }
+
+    @Test fun `inactivitySuppressedByElevatedHr - true for zone 3+, false for zone 1-2 and null`() {
+        fun classForBpm(bpm: Double) = HrActivityCalculator.classify(
+            hrReadings = makeReadings(bpm), nowMillis = NOW, hrWindowMinutes = WINDOW_MIN,
+            hrMax = 180, hrResting = 60, stepsLast15Min = 5, stressDetection = false
+        )
+        // zone 3 (110 bpm, ~42% HRR) and above → suppress the inactivity insulin
+        assertThat(HrActivityCalculator.inactivitySuppressedByElevatedHr(classForBpm(110.0))).isTrue()
+        assertThat(HrActivityCalculator.inactivitySuppressedByElevatedHr(classForBpm(160.0))).isTrue()
+        // zone 2 (100 bpm, 33% HRR) and zone 1 (65 bpm) → do not suppress
+        assertThat(HrActivityCalculator.inactivitySuppressedByElevatedHr(classForBpm(100.0))).isFalse()
+        assertThat(HrActivityCalculator.inactivitySuppressedByElevatedHr(classForBpm(65.0))).isFalse()
+        // no classification at all → do not suppress (falls to normal inactivity logic)
+        assertThat(HrActivityCalculator.inactivitySuppressedByElevatedHr(null)).isFalse()
     }
 
     @Test fun `classify - no HR data returns NONE zone and falls back gracefully`() {

@@ -238,9 +238,13 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
         binding.v2PillProfile.setOnClickListener(this)
         binding.v2V5Strip.setOnClickListener(this)
 
-        // Bottom action buttons
+        // Bottom action buttons (pref-toggled, same keys as the standard overview)
         binding.v2BtnInsulin.setOnClickListener(this)
         binding.v2BtnCalculator.setOnClickListener(this)
+        binding.v2BtnCarbs.setOnClickListener(this)
+        binding.v2BtnTreatment.setOnClickListener(this)
+        binding.v2BtnCalibration.setOnClickListener(this)
+        binding.v2BtnCgm.setOnClickListener(this)
 
         // Target value tap -> temp target dialog
         binding.v2TargetValue.setOnClickListener(this)
@@ -341,7 +345,14 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
         disposable += rxBus
             .toObservable(EventPreferenceChange::class.java)
             .observeOn(aapsSchedulers.io)
-            .subscribe({ scheduleUpdateGUI() }, fabricPrivacy::logException)
+            .subscribe({
+                // A RangeToDisplay (hours) change already drives a full recompute + graph repaint via
+                // the calculation workflow (IobCobCalculator → runOnScaleChanged/EventNewHistoryData →
+                // EventUpdateOverviewGraph → updateGraph). Running our own refreshAll on top repaints
+                // all three graphs on the main thread 1–2 extra times per tap — the slow-load/jank on a
+                // range change. Skip it for that key; every other pref change still refreshes.
+                if (!it.isChanged(IntNonKey.RangeToDisplay.key)) scheduleUpdateGUI()
+            }, fabricPrivacy::logException)
         disposable += rxBus
             .toObservable(EventScale::class.java)
             .observeOn(aapsSchedulers.main)
@@ -824,31 +835,43 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
         val menuChartSettings = overviewMenus.setting
         if (menuChartSettings.isEmpty()) return
 
-        graphData.addInRangeArea(overviewData.fromTime, overviewData.endTime,
-            preferences.get(UnitDoubleKey.OverviewLowMark), preferences.get(UnitDoubleKey.OverviewHighMark))
-        graphData.addBgReadings(menuChartSettings[0][OverviewMenus.CharType.PRE.ordinal], ctx)
-        graphData.addBucketedData()
-        graphData.addTreatments(ctx)
-        graphData.addEps(ctx, 0.95)
-        if (menuChartSettings[0][OverviewMenus.CharType.TREAT.ordinal]) graphData.addTherapyEvents()
-        if (menuChartSettings[0][OverviewMenus.CharType.ACT.ordinal]) graphData.addActivity(0.8)
-        if ((pump.pumpDescription.isTempBasalCapable || config.AAPSCLIENT) && menuChartSettings[0][OverviewMenus.CharType.BAS.ordinal])
-            graphData.addBasals()
-        graphData.addTargetLine()
-        graphData.addRunningModes()
-        graphData.addNowLine(dateUtil.now())
-        graphData.setNumVerticalLabels()
-        graphData.formatAxis(overviewData.fromTime, overviewData.endTime)
-        graphData.performUpdate()
-        graphData.applyV2Theme()
+        // Guarded so a render hiccup can never throw to the main looper and force-close the app.
+        // updateGraph() runs on the main thread and reads overviewData series that the calculation
+        // workers concurrently rebuild/reassign on a range change; a transient (e.g. a NaN scale
+        // divisor on a just-reset series, or a partially-prepared window) must degrade to "no repaint
+        // this pass", not a crash. The steps/HR block below has always had its own guard; this
+        // extends the same protection to the BG+IOB render, which was the unguarded crash path
+        // reached via refreshAll → runOnUiThread. (2026-07-16 — v2 hours-change crash.)
+        try {
+            graphData.addInRangeArea(overviewData.fromTime, overviewData.endTime,
+                preferences.get(UnitDoubleKey.OverviewLowMark), preferences.get(UnitDoubleKey.OverviewHighMark))
+            graphData.addBgReadings(menuChartSettings[0][OverviewMenus.CharType.PRE.ordinal], ctx)
+            graphData.addBucketedData()
+            graphData.addTreatments(ctx)
+            graphData.addEps(ctx, 0.95)
+            if (menuChartSettings[0][OverviewMenus.CharType.TREAT.ordinal]) graphData.addTherapyEvents()
+            if (menuChartSettings[0][OverviewMenus.CharType.ACT.ordinal]) graphData.addActivity(0.8)
+            if ((pump.pumpDescription.isTempBasalCapable || config.AAPSCLIENT) && menuChartSettings[0][OverviewMenus.CharType.BAS.ordinal])
+                graphData.addBasals()
+            graphData.addTargetLine()
+            graphData.addRunningModes()
+            graphData.addNowLine(dateUtil.now())
+            graphData.setNumVerticalLabels()
+            graphData.formatAxis(overviewData.fromTime, overviewData.endTime)
+            graphData.performUpdate()
+            graphData.applyV2Theme()
 
-        // IOB graph
-        val iobGraphData = graphDataProvider.get().with(binding.v2IobGraph, overviewData)
-        iobGraphData.addIob(true, 1.0)
-        iobGraphData.addNowLine(dateUtil.now())
-        iobGraphData.formatAxis(overviewData.fromTime, overviewData.endTime)
-        iobGraphData.performUpdate()
-        iobGraphData.applyV2Theme()
+            // IOB graph
+            val iobGraphData = graphDataProvider.get().with(binding.v2IobGraph, overviewData)
+            iobGraphData.addIob(true, 1.0)
+            iobGraphData.addNowLine(dateUtil.now())
+            iobGraphData.formatAxis(overviewData.fromTime, overviewData.endTime)
+            iobGraphData.performUpdate()
+            iobGraphData.applyV2Theme()
+        } catch (e: Exception) {
+            aapsLogger.error(LTag.UI, "V2 BG/IOB graph render failed", e)
+            return
+        }
 
         // Activity graph (steps + heart rate) — replaces the old sensitivity preview. DATA-DRIVEN:
         // show whichever of steps/HR actually has data in the visible window; hide the whole card
@@ -933,7 +956,7 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
             binding.v2ButtonsLayout.quickWizardButton.visibility = View.GONE
         }
 
-        // Hide standard buttons that V2 replaces with its own UI
+        // Hide the standard row's fixed treatment buttons — V2 renders its own card buttons instead.
         binding.v2ButtonsLayout.treatmentButton.visibility = View.GONE
         binding.v2ButtonsLayout.wizardButton.visibility = View.GONE
         binding.v2ButtonsLayout.insulinButton.visibility = View.GONE
@@ -941,10 +964,94 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
         binding.v2ButtonsLayout.calibrationButton.visibility = View.GONE
         binding.v2ButtonsLayout.cgmButton.visibility = View.GONE
 
-        // Show the standard buttons layout only if accept temp or quick wizard is visible
+        // Automation user-action buttons — dynamic/swappable row, same source as the standard overview.
+        val hasUserActions = processUserActionButtons(pump, profile)
+
+        // V2's own card buttons: pref-driven visibility using the SAME keys as the standard overview,
+        // so they toggle from the same Config → Overview → Buttons settings.
+        binding.v2BtnInsulin.visibility = preferences.get(BooleanKey.OverviewShowInsulinButton).toVisibility()
+        binding.v2BtnCalculator.visibility = preferences.get(BooleanKey.OverviewShowWizardButton).toVisibility()
+        binding.v2BtnCarbs.visibility = preferences.get(BooleanKey.OverviewShowCarbsButton).toVisibility()
+        binding.v2BtnTreatment.visibility = preferences.get(BooleanKey.OverviewShowTreatmentButton).toVisibility()
+        binding.v2BtnCalibration.visibility =
+            (preferences.get(BooleanKey.OverviewShowCalibrationButton) && xDripSource.isEnabled()).toVisibility()
+        binding.v2BtnCgm.visibility =
+            (preferences.get(BooleanKey.OverviewShowCgmButton) && (xDripSource.isEnabled() || dexcomBoyda.isEnabled())).toVisibility()
+
+        // Show the included standard layout when accept-temp, quick-wizard, or any user action is present.
         val anyVisible = binding.v2ButtonsLayout.acceptTempButton.visibility == View.VISIBLE ||
-            binding.v2ButtonsLayout.quickWizardButton.visibility == View.VISIBLE
+            binding.v2ButtonsLayout.quickWizardButton.visibility == View.VISIBLE ||
+            hasUserActions
         binding.v2ButtonsLayout.root.visibility = anyVisible.toVisibility()
+    }
+
+    /**
+     * Populates the automation user-action button row (dynamic/swappable). Mirrors the standard
+     * overview's mechanism: one [SingleClickButton] per enabled, runnable automation user event.
+     * Returns true if any user-action button is showing.
+     */
+    private fun processUserActionButtons(
+        pump: app.aaps.core.interfaces.pump.Pump,
+        profile: app.aaps.core.interfaces.profile.Profile?
+    ): Boolean {
+        var list = ""
+        val container = binding.v2ButtonsLayout.userButtonsLayout
+        container.removeAllViews()
+        val events = automation.userEvents()
+        if (!loop.runningMode.isSuspended() && pump.isInitialized() && profile != null && !config.showUserActionsOnWatchOnly())
+            for (event in events)
+                if (event.isEnabled && event.canRun()) {
+                    context?.let { ctx ->
+                        app.aaps.core.ui.elements.SingleClickButton(ctx, null, app.aaps.core.ui.R.attr.customBtnStyle).also { btn ->
+                            btn.setTextColor(rh.gac(ctx, app.aaps.core.ui.R.attr.userOptionColor))
+                            btn.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 10f)
+                            btn.layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0.5f).also { l ->
+                                l.setMargins(rh.dpToPx(1), 0, rh.dpToPx(1), 0)
+                            }
+                            btn.setPadding(rh.dpToPx(1), btn.paddingTop, rh.dpToPx(1), btn.paddingBottom)
+                            btn.compoundDrawablePadding = rh.dpToPx(-4)
+                            btn.setCompoundDrawablesWithIntrinsicBounds(
+                                null,
+                                rh.gd(event.firstActionIcon() ?: app.aaps.core.ui.R.drawable.ic_user_options_24dp).also { icon ->
+                                    icon?.setBounds(rh.dpToPx(20), rh.dpToPx(20), rh.dpToPx(20), rh.dpToPx(20))
+                                }, null, null
+                            )
+                            btn.text = event.title
+                            btn.setOnClickListener {
+                                OKDialog.showConfirmation(
+                                    ctx, rh.gs(R.string.run_question, event.title),
+                                    Runnable { handler.post { automation.processEvent(event) } }
+                                )
+                            }
+                            container.addView(btn)
+                            for (d in btn.compoundDrawables) {
+                                d?.mutate()
+                                d?.colorFilter = android.graphics.PorterDuffColorFilter(rh.gac(ctx, app.aaps.core.ui.R.attr.userOptionColor), android.graphics.PorterDuff.Mode.SRC_IN)
+                            }
+                        }
+                    }
+                    list += event.hashCode()
+                }
+        container.visibility = events.isNotEmpty().toVisibility()
+        if (list != lastUserAction) {
+            lastUserAction = list
+            rxBus.send(EventWearUpdateTiles())
+        }
+        return events.isNotEmpty()
+    }
+
+    /** Opens an external CGM app (xDrip / Dexcom) — mirrors the standard overview's cgm button. */
+    private fun openCgmApp(packageName: String) {
+        context?.let {
+            try {
+                val intent = it.packageManager.getLaunchIntentForPackage(packageName)
+                    ?: throw android.content.ActivityNotFoundException()
+                intent.addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+                it.startActivity(intent)
+            } catch (_: android.content.ActivityNotFoundException) {
+                aapsLogger.debug(LTag.CORE, "Error opening CGM app")
+            }
+        }
     }
 
     // --- Click handlers ---
@@ -1026,6 +1133,21 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
                     protectionCheck.queryProtection(a, ProtectionCheck.Protection.BOLUS,
                         UIRunnable { if (isAdded) uiInteraction.runWizardDialog(childFragmentManager) })
                 }
+                R.id.v2_btn_carbs -> {
+                    protectionCheck.queryProtection(a, ProtectionCheck.Protection.BOLUS,
+                        UIRunnable { if (isAdded) uiInteraction.runCarbsDialog(childFragmentManager) })
+                }
+                R.id.v2_btn_treatment -> {
+                    protectionCheck.queryProtection(a, ProtectionCheck.Protection.BOLUS,
+                        UIRunnable { if (isAdded) uiInteraction.runTreatmentDialog(childFragmentManager) })
+                }
+                R.id.v2_btn_calibration -> {
+                    if (xDripSource.isEnabled()) uiInteraction.runCalibrationDialog(childFragmentManager)
+                }
+                R.id.v2_btn_cgm -> {
+                    if (xDripSource.isEnabled()) openCgmApp("com.eveningoutpost.dexdrip")
+                    else if (dexcomBoyda.isEnabled()) dexcomBoyda.dexcomPackages().forEach { openCgmApp(it) }
+                }
 
                 // AID status tap -> loop dialog
                 R.id.v2_aid_status, R.id.v2_aid_dot -> {
@@ -1038,13 +1160,16 @@ class BoostOverviewV2Fragment : DaggerFragment(), View.OnClickListener {
                 R.id.accept_temp_button -> {
                     protectionCheck.queryProtection(a, ProtectionCheck.Protection.BOLUS, UIRunnable {
                         if (isAdded) {
+                            // Must ENACT the pending open-loop change, not re-run the loop. The old code
+                            // called loop.invoke() (which just re-triggers the APS) and logged
+                            // ACCEPTS_TEMP_BASAL without ever calling acceptChangeRequest() — so for an
+                            // open-loop user the tap reached the pump with nothing while the audit trail
+                            // said "accepted". Mirror stock OverviewFragment. (2026-07-16)
                             val lastRun = loop.lastRun
-                            loop.invoke("Accept temp button", false)
                             if (lastRun?.lastAPSRun != null && lastRun.constraintsProcessed?.isChangeRequested == true) {
-                                protectionCheck.queryProtection(a, ProtectionCheck.Protection.BOLUS, UIRunnable {
-                                    uel.log(Action.ACCEPTS_TEMP_BASAL, Sources.Overview)
-                                    binding.v2ButtonsLayout.acceptTempButton.visibility = View.GONE
-                                })
+                                uel.log(Action.ACCEPTS_TEMP_BASAL, Sources.Overview)
+                                handler.post { loop.acceptChangeRequest() }
+                                binding.v2ButtonsLayout.acceptTempButton.visibility = View.GONE
                             }
                         }
                     })

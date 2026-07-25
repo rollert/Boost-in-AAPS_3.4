@@ -185,12 +185,13 @@ object SleepHistoryTracker {
         val restingHr = if (restingHrSamples.size >= MIN_SESSIONS_FOR_LEARNED) median(restingHrSamples) else null
         val daytimeHr = if (daytimeHrSamples.size >= MIN_SESSIONS_FOR_LEARNED) median(daytimeHrSamples) else null
 
-        // Learned WAKE time is trained ONLY on genuine wakes ("hr_steps"/"resume"); "boundary"
+        // Learned WAKE time is trained ONLY on genuine wakes ("hr_steps"/"resume"/"steps"); "boundary"
         // hard-exit wakes (and legacy null) are excluded, with its own session-count gate. This
         // breaks the hard-exit→learned-wake feedback loop: without a genuine wake signal (e.g. a
         // sparse-HR night) wakeMinAvg stays null and the caller falls back to the configured wake.
+        // "steps" (2026-07-08): steps-only wake when HR is unreliable — genuine, so it trains too.
         val genuineWakeMins = h.sessions
-            .filter { it.wakeReason == "hr_steps" || it.wakeReason == "resume" }
+            .filter { it.wakeReason == "hr_steps" || it.wakeReason == "resume" || it.wakeReason == "steps" }
             .map { msToMinOfDay(it.wakeMs, localOffsetMs) }
         val wakeAvg = if (genuineWakeMins.size >= MIN_SESSIONS_FOR_LEARNED) circularMean(genuineWakeMins) else null
 

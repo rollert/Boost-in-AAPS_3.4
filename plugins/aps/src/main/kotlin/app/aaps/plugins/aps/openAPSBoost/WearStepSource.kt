@@ -28,6 +28,22 @@ object WearStepSource {
         latest(scList)?.let { nowMs - it.timestamp <= FRESH_MS } ?: false
 
     /**
+     * Grace window for today's-count RESOLUTION (2026-07-07). The watch's sampling cadence
+     * straddles the 12-min [FRESH_MS] line, so strict freshness flapped the resolved source
+     * wear↔phone every 2-3 cycles overnight (wear 349 vs phone 32 — the 07-06/07 telemetry):
+     * StepSourceResolver prefers the highest-trust FRESH source, and each brief staleness handed
+     * today's count to the live-but-tiny phone. The wear today-count is reconstructed from the
+     * day's SC rows, so it stays valid while the feed is briefly quiet — for resolution only,
+     * treat wear as live within this longer grace. [FRESH_MS] keeps its strict meaning for
+     * feed-availability (StepFeed) and per-source telemetry.
+     */
+    const val RESOLVE_GRACE_MS = 30 * 60_000L
+
+    /** [isFresh] with the [RESOLVE_GRACE_MS] window — for step-source resolution only. */
+    fun isRecentlyFresh(scList: List<SC>, nowMs: Long): Boolean =
+        latest(scList)?.let { nowMs - it.timestamp <= RESOLVE_GRACE_MS } ?: false
+
+    /**
      * Cumulative steps since [dayStartMs] reconstructed from the rolling 5-min windows: take one
      * `steps5min` value per non-overlapping 5-min slot (the max seen in that slot, since the watch
      * samples more often than every 5 min and windows overlap) and sum. Approximate but stable, and

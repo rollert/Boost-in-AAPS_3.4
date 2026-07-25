@@ -26,6 +26,24 @@ object StepService : SensorEventListener {
     private const val FIVE_MINUTES_IN_MS = 300000
     private const val NUM_OF_5MIN_BLOCKS_TO_KEEP = 20
 
+    // ── Feed-state visibility (F1, 2026-07-07) ──
+    // TYPE_STEP_COUNTER never reports until the sensor delivers its first event after boot /
+    // listener registration; until then every window reads 0 — indistinguishable from a genuinely
+    // sedentary user. feedState() lets consumers (calculateBoostActivity's INACTIVE branch and the
+    // sleep-in backstop) tell "no data" from "no steps" instead of dosing on a silent feed.
+    /** Wall-clock ms of the last onSensorChanged callback (0 = none this process). */
+    @Volatile var lastEventMs: Long = 0L
+        private set
+
+    enum class FeedState {
+        /** The step sensor has never reported this boot (previousStepCount == -1): counts are unknowable, not zero. */
+        NONE,
+        /** The sensor has reported at least once this process — zero counts mean genuinely no steps. */
+        LIVE
+    }
+
+    fun feedState(): FeedState = if (previousStepCount < 0) FeedState.NONE else FeedState.LIVE
+
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         Log.i(TAG, "onAccuracyChanged: Sensor: $sensor; accuracy: $accuracy")
     }
@@ -36,6 +54,7 @@ object StepService : SensorEventListener {
 
     @Synchronized override fun onSensorChanged(sensorEvent: SensorEvent?) {
         sensorEvent ?: return
+        lastEventMs = System.currentTimeMillis()
 
         val now = currentTimeIn5Min()
         val stepCount = sensorEvent.values[0].toInt()

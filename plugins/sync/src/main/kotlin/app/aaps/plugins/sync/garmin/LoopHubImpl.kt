@@ -5,6 +5,7 @@ import app.aaps.core.data.model.GV
 import app.aaps.core.data.model.GlucoseUnit
 import app.aaps.core.data.model.HR
 import app.aaps.core.data.model.RM
+import app.aaps.core.data.model.SC
 import app.aaps.core.data.model.TE
 import app.aaps.core.data.ue.Action
 import app.aaps.core.data.ue.Sources
@@ -167,5 +168,41 @@ class LoopHubImpl @Inject constructor(
             device = device ?: "Garmin",
         )
         disposable += persistenceLayer.insertOrUpdateHeartRate(hr).subscribe()
+    }
+
+    override fun storeSteps(
+        timestampMs: Long,
+        steps5min: Int, steps10min: Int, steps15min: Int,
+        steps30min: Int, steps60min: Int, steps180min: Int,
+        device: String?
+    ) {
+        if (timestampMs <= 0L) return
+        val sc = SC(
+            duration = 300_000L,          // 5-min snapshot (mirrors the wear cadence)
+            timestamp = timestampMs,
+            steps5min = steps5min, steps10min = steps10min, steps15min = steps15min,
+            steps30min = steps30min, steps60min = steps60min, steps180min = steps180min,
+            device = device ?: "Garmin",
+            dateCreated = clock.millis(),
+        )
+        disposable += persistenceLayer.insertOrUpdateStepsCount(sc).subscribe()
+    }
+
+    override fun storeHeartRates(samples: List<Pair<Long, Int>>, device: String?) {
+        // Correct HR-model convention: timestamp = END of the minute, duration = 60 000 (matches
+        // HealthConnectHrIngest so overlapping rows dedupe by minute bucket). insertOrUpdate is
+        // idempotent, so a backfill batch on BT reconnect is safe to replay.
+        val dev = device ?: "Garmin"
+        for ((endMs, bpm) in samples) {
+            if (bpm <= 10 || endMs <= 0L) continue
+            val hr = HR(
+                timestamp = endMs,
+                duration = 60_000L,
+                dateCreated = clock.millis(),
+                beatsPerMinute = bpm.toDouble(),
+                device = dev,
+            )
+            disposable += persistenceLayer.insertOrUpdateHeartRate(hr).subscribe()
+        }
     }
 }

@@ -2,13 +2,20 @@
 
 A comparison of the original Boost (V1) and the new V5 redesign.
 
+> **Status (2026-07):** this document was written during V5's development. V5 has since
+> graduated to production as the user-facing **"Boost V6"** plugin — see
+> [Currently — what V5 is and isn't](#currently--what-v5-is-and-isnt-updated-2026-07)
+> and the main [README](../../../../../../../../../../README.md) for the current picture.
+> The design rationale below is unchanged and still authoritative.
+
 V1 reference: `~/StudioProjects/AndroidAPS/master/openAPSBoost/` (the canonical
 V1 source). V5 reference: `~/StudioProjects/Boost-AAPS-core/openAPSBoostV5/`.
 
 
 ## TL;DR
 
-- **V5 adds 3 new user settings; most of V1's settings still apply.** V5
+- **V5 adds 3 headline settings (plus an Advanced screen of dose caps);
+  most of V1's settings still apply.** V5
   replaces the dose-sizing dials inside `determineBasal` (boost_scale,
   insulin_req_pct, percent_scale_factor, bolus_cap, etc.) with hardcoded
   calibrated values. The upstream environment settings (sleep-in,
@@ -26,9 +33,10 @@ V1 source). V5 reference: `~/StudioProjects/Boost-AAPS-core/openAPSBoostV5/`.
   Boost figures out your sensitivity — it inherits all that from V1's
   existing pipeline. So your TDD-based ISF, autosens, hour-of-day basal
   rates, etc. all still apply.
-- **V5 is currently shadow-only.** It runs alongside whatever Boost variant
-  you have selected, makes its own decision, and writes that to the log —
-  but doesn't dose. You stay on your existing Boost while V5 collects data.
+- **V5 ships as the "Boost V6" plugin.** Selecting "Boost V6" makes the
+  state machine drive the SMB; selecting plain "Boost" runs V1 dosing with
+  the V5/V6 decision in shadow (logged to Nightscout, never dosed).
+  Shadow-first is the supported path for anyone but the developer.
 
 
 ## Why V5 was built
@@ -97,17 +105,21 @@ V5 was designed to:
 4. **Reduce the settings burden.** Move the dose-sizing dials to
    hardcoded values calibrated once at release; expose only knobs where
    users genuinely have a basis to choose a value.
-5. **Make decisions reconstructable.** Six NS fields fully describe any
-   V5 cycle's reasoning so behaviour can be analysed after the fact
-   without grepping logs.
+5. **Make decisions reconstructable.** A block of `boostV5_*` NS fields
+   (17 at time of writing — `RT.kt:91-123`) describes each V5 cycle's reasoning
+   so behaviour can be analysed after the fact without grepping logs. Persisted
+   state itself is a much smaller ~5-field blob (`V5PersistedState` +
+   `MealHypothesisState`).
 
 ### What V5 explicitly is not trying to do
 
 - **Not faster dosing on average.** V5's post-exercise modifier and ML
   hypo-risk damping make it more conservative in many situations.
   The goal is *correct* dosing, not maximum dosing.
-- **Not a clinical superiority claim.** V5 is PRE-ALPHA. There is no
-  demonstrated TIR / TBR improvement vs the current Boost yet.
+- **Not a clinical superiority claim.** The evidence is one developer's
+  ~5 months of active use plus a small shadow cohort — real-world
+  experience, not a demonstrated TIR / TBR improvement vs the current
+  Boost (see the README's Testing & evidence section).
 - **Not a replacement for sensitivity calibration.** DynISF, autosens,
   hour-of-day basal / ISF are all preserved unchanged. V5 trusts the
   user's existing sensitivity setup.
@@ -134,13 +146,13 @@ upstream of the dosing decision; V5 inherits them automatically.
 (sliding scale BG 108→180), `boost_bolus_cap` and the per-tier toggles. V5
 has its own action multipliers per state and its own dynamic dose cap.
 
-**You gain three new dials**, and the third is reserved for future use:
+**You gain three new dials**:
 
 | Setting | Default | Range | What it does |
 |---|---|---|---|
 | **Aggression** | 1.0 | 0.7–1.3 | Scales V5's catch-up dose at the moment it commits to "this is a meal." Lower is gentler, higher is more aggressive. |
 | **Hypo Caution** | 1.0 | 1.0–2.0 | Strengthens the brake when the ML model thinks a hypo is likely. Raise it if you have hypo unawareness or recent severe lows. |
-| **Sensitivity** | 1.0 | 0.8–1.2 | Reserved — currently has no effect. May ship in a future release if backtesting justifies. |
+| **Sensitivity** | 1.0 | 0.8–1.2 | **Live** — a per-user calibration lever on the whole aggression budget. The value is coerced into 0.8–1.2 and multiplied into the budget (`AggressionBudget.kt:91-92`); < 1.0 trims a hot-running user, > 1.0 lets it run firmer. |
 
 V5's internal numbers (score weights, state-machine thresholds, IOB-headroom
 curve points) are hardcoded — calibrated once by the developers from
@@ -189,15 +201,15 @@ take the first one that matches.
 
 V5 is a **state machine + safety layer**:
 
-1. **Watch.** Combine 6 signals (BG delta, acceleration, ML meal-likelihood,
-   recent-low penalty, time of day, exercise state) into a single
-   "is this a meal?" score from 0 to 1.
+1. **Watch.** Combine 7 signals (BG delta, acceleration, ML meal-likelihood,
+   recent-low penalty, time of day, exercise state, sustained 30-min rise) into a
+   single "is this a meal?" score from 0 to 1.
 2. **Track.** Carry that score across cycles. Move through states:
    IDLE → OBSERVING (testing) → CONFIRMED (catch-up) → COMMITTED (sustain)
    → RECOVERING (back off) → IDLE.
-3. **Calculate.** Take what oref calculated as needed insulin, apply two
-   safety multipliers (ML hypo risk and post-exercise damping), enforce a
-   minimum 30% floor.
+3. **Calculate.** Take what oref calculated as needed insulin, apply three
+   multipliers (ML hypo risk × post-exercise damping × the user Sensitivity knob
+   0.8–1.2), enforce a minimum 30% floor.
 4. **Decide.** Multiply by the state's action factor (0.3× for OBSERVING,
    1.8× for CONFIRMED, etc.). One number out.
 5. **Check.** Pass the dose through ordered safety gates (low-BG predicted
@@ -277,10 +289,11 @@ These are genuinely new — V1 has no equivalent:
 - **Graduated IOB headroom brake.** As IOB approaches your max, V5 smoothly
   reduces the dose (85% → 60% → 40% as IOB-fraction crosses 0.5/0.7/0.85).
   V1 has a hard cap on Tier 7 only.
-- **6 NS observability fields.** Anyone reading your Nightscout deviceStatus
-  sees V5's score, hypothesis state, age, budget, action multiplier, and
-  any safety reductions for every cycle. V1 emits a tier name and the
-  modulators are buried in console logs.
+- **17 NS observability fields.** Anyone reading your Nightscout deviceStatus
+  sees V5's score, hypothesis state, age, budget, action multiplier, final dose,
+  gate reductions, confirm-gate outcome, caps, and more for every cycle
+  (`RT.kt:91-123`). V1 emits a tier name and the modulators are buried in
+  console logs.
 
 
 ## What V5 replaces (dose-sizing logic inside `determineBasal`)
@@ -341,23 +354,27 @@ candidate for becoming a knob. If either condition fails, it stays
 hardcoded.
 
 
-## Currently — what V5 is and isn't
+## Currently — what V5 is and isn't (updated 2026-07)
 
-V5 is **PRE-ALPHA** and **shadow-only**. It is hidden from the plugin list
-(you cannot select it as your active APS algorithm). During development
-testing it runs alongside the active Boost variant as a **sidecar**:
+V5 **graduated to production as the "Boost V6" plugin** after the shadow
+acceptance gates passed. Two selectable plugins share one engine:
 
-1. The active Boost finishes its normal cycle and decides what to dose.
-2. Its inputs (glucose status, IOB, ML predictions where present,
-   sensitivity values, exercise state) are handed to V5.
-3. V5 runs its own decision on the same inputs and logs the result to
-   `aapsLogger` with prefix `BoostV5_RT:` and to Nightscout deviceStatus
-   under `boostV5_*` fields.
-4. V5 does **not** affect what was actually dosed.
+- **"Boost"** — V1 dosing, with the V5/V6 decision computed as a
+  **sidecar shadow** every cycle: the same inputs (glucose status, IOB,
+  ML predictions where present, sensitivity values, exercise state) are
+  handed to V5, which logs its decision to `aapsLogger` with prefix
+  `BoostV5_RT:` and to Nightscout deviceStatus under `boostV5_*` fields —
+  without affecting what was dosed.
+- **"Boost V6"** — the state machine drives the SMB. The override is
+  gated: suppressed while asleep, capped at V1's would-dose outside
+  CONFIRMED/COMMITTED, re-checked against the cumulative 60-minute SMB
+  cap, and clamped to the system max-IOB. On first activation an
+  auto-config seeds the knobs from the user's own 14-day history
+  (suggestion-only — see the README, §4).
 
-Test builds collect parallel V5 decisions for analysis. V5 will only
-become user-selectable in the plugin list after the test plan's Layer
-1–3 acceptance gates pass on real shadow data.
+Shadow-first remains the supported onboarding for anyone but the
+developer: run "Boost", watch the paired telemetry in Nightscout for a
+couple of weeks, then decide.
 
 
 ---
@@ -396,7 +413,7 @@ Modulators applied after tier selection in V1:
 PHASE 1 — STATE ESTIMATION (no commitment)
   meal_signal_score(...)                — continuous 0–1 weighted sum of 6 signals
   mealHypothesis state machine step()   — 5 states with explicit transitions
-  aggressionBudget(...)                 — baseInsulinReq × mlHypoRiskScale × postExerciseRecoveryModifier
+  aggressionBudget(...)                 — baseInsulinReq × mlHypoRiskScale × postExerciseRecoveryModifier × sensitivityKnob(0.8–1.2)
                                           floored at 0.30 × baseInsulinReq
 
 PHASE 2 — DECISION (single rule)
@@ -411,33 +428,55 @@ PHASE 3 — SAFETY GATES (ordered)
     round(roundSMBTo) → dynamicSpikeCap (2.5×) → max(0)
 ```
 
-### The 6 components of `meal_signal_score`
+### The 7 components of `meal_signal_score`
 
-Each weighted; weights are hardcoded.
+Each weighted; weights are hardcoded. Weights **sum to 1.07** (not 1.0 — the
+2026-05/06 calibration retuned individual weights and Fix 4 added `sustainedRise`
+without renormalising the total; the score is clipped to [0,1] regardless).
+Verified against `MealSignalScore.kt:25-31`.
 
 | Signal | Weight | What it represents |
 |---|---|---|
 | `delta` | 0.30 | Current 5-min BG rise |
 | `delta_accl` | 0.16 | Acceleration of the rise |
 | `mlMealLikely` | 0.20 | ML model's probability of a meal-driven peak |
-| `notRecentlyLow` | 0.12 | Continuous penalty (0 at recentLowBG=70, 1 at ≥100) — replaces V1's binary fast-carb-rebound trigger |
+| `notRecentlyLow` | 0.12 | Continuous penalty (**floor 0.4** at recentLowBG ≤ 70, 1.0 at ≥ 100; `MealSignalScore.kt:197`, softened 2026-05-15) — replaces V1's binary fast-carb-rebound trigger |
 | `mealTimeOfDay` | 0.10 | Smooth bumps near typical meal hours (8/13/19) |
 | `notExercising` | 0.04 | Suppresses score when an exercise mode is active |
+| `sustainedRise` | 0.15 | Cumulative BG rise over ~30 min (0 at ≤ 20 mg/dL, 1.0 at ≥ 60) — catches slow meals the single-cycle delta saturator misses (Fix 4, 2026-05-22) |
 
-If `mlMealLikely` is null for ≥3 consecutive cycles (model load failure),
-V5 drops its weight and renormalises the remaining 5 to compensate, so
-the score ceiling stays consistent.
+If `mlMealLikely` is null for ≥3 consecutive cycles (model load failure), V5 drops
+its weight and rescales the remaining **six** by `ML_MEAL_RENORMALIZE_FACTOR =
+SCORE_WEIGHT_TOTAL / (SCORE_WEIGHT_TOTAL − 0.20) ≈ 1.23` (`MealSignalScore.kt:73`), so
+the score ceiling stays consistent. The weights never sum to 1.0 — the rescale is by
+that ratio, not a normalise-to-1.0.
 
 ### State machine transitions
 
 | From | To | Trigger |
 |---|---|---|
 | IDLE | OBSERVING | score ≥ 0.44 |
-| OBSERVING | CONFIRMED | age ≥ 2 cycles AND score ≥ 0.66 AND eventualBG > target+50 |
-| OBSERVING | IDLE | score < 0.36 for ≥ 2 cycles (hysteresis) |
-| CONFIRMED | COMMITTED | after 1 cycle |
+| OBSERVING | CONFIRMED | age ≥ 2 cycles AND **peak** score ≥ 0.55 AND **peak** (eventualBG − target) ≥ 30 (`MealHypothesis.kt:103-104`) — see the extra paths + gates below |
+| OBSERVING | IDLE | score < 0.36 AND OBSERVING age ≥ 2 (one sub-threshold blip after age 2 exits) |
+| CONFIRMED | COMMITTED | after this cycle (`CONFIRMED_TO_COMMITTED_AGE = 0`, single-cycle commit) |
 | COMMITTED | RECOVERING | delta_accl < -5 AND delta declining over last 2 cycles |
+| RECOVERING | COMMITTED | re-engage: age ≥ 1 AND delta_accl > 10 AND delta > 3 AND (eventualBG − target) > 20 (two-phase meal — resumes 1.0×, NOT a new CONFIRMED shot) |
 | RECOVERING | IDLE | delta < 0 OR score < 0.18 |
+
+**The confirm predicate is not a single instantaneous test.** Beyond the peak-tracked
+score/offset above, OBSERVING → CONFIRMED also carries:
+
+- a **dose-adequacy gate** (`confirmDoseAdequate`) — the prospective commit-shot must
+  beat one routine COMMITTED hold, else the token isn't spent;
+- a **single-CONFIRMED-per-session lock** (`committedInSession`) — one commit-shot per
+  meal, reset only on the RECOVERING → IDLE exit or a fresh OBSERVING entry (Fix 6);
+- a **sustained-score early-confirm** — the age gate opens ONE cycle early
+  (`CONFIRM_MIN_OBSERVING_AGE_SCORE_READY`) when the *instantaneous* score is ≥ 0.55 on
+  both this and the prior cycle (`scoreReadyStreak`, `MealHypothesis.kt:107-121`);
+- a **fast-carb single-cycle path** — IDLE/OBSERVING → CONFIRMED in one cycle when
+  delta ≥ 6 AND delta_accl ≥ 10 AND score ≥ 0.65, awake, not exercising, and
+  recentLowBG ≥ 80 (`MealHypothesis.kt:188-207`); bypasses the age + offset gates but
+  still honours the single-confirm lock.
 
 Reset to IDLE on: reboot, pump disconnect, loop suspend, profile switch,
 time jump > 30 min.
@@ -457,7 +496,7 @@ time jump > 30 min.
 | Gate | Trigger / curve |
 |---|---|
 | `iobHeadroomBrake` | iob_fraction < 0.5 → 1.0 (no brake); 0.5–0.7 → 0.85; 0.7–0.85 → 0.6; ≥ 0.85 → 0.4 |
-| `decelerationBrake` | If `delta_accl < -10` AND `IOB > 0.5×max`: scale 0.5 |
+| `decelerationBrake` | (re-spec 2026-06-14, `SafetyGates.kt:91-93,204-210`) Full dose (1.0) while `delta_accl ≥ 0` OR `delta > 8` (still climbing fast — V1 T4 velocity fallback). Once accl < 0 and not climbing fast: graduated ease-off, linear 1.0 (accl=0) → `DECEL_BRAKE_FLOOR` **0.30** (accl ≤ −15). **IOB-independent** — the old `IOB > 0.5×max` coupling was removed; `iobHeadroomBrake` owns IOB. |
 | `postActionRiskCheck` | Re-runs ML hypo-risk model at projected (iob + dose); damps if projection > current + 0.15 AND > 0.40, floor 0.30 |
 | `sensorQualityCheck` | 0.7 if sensor data flagged bad; otherwise 1.0 |
 | `dynamicSpikeCap` | Final dose capped at 2.5 × baseInsulinReq |
@@ -472,8 +511,8 @@ final_smb = tier_dose × fastCarbScale       # only on Tiers 3/5/6, only when re
 V5:
 ```
 aggression_budget = max(
-  0.30 × baseInsulinReq,                                                # hard floor — never below 30%
-  baseInsulinReq × mlHypoRiskScale() × postExerciseRecoveryModifier()   # the chain
+  0.30 × baseInsulinReq,                                                              # hard floor — never below 30%
+  baseInsulinReq × mlHypoRiskScale() × postExerciseRecoveryModifier() × sensitivity   # the chain (sensitivity = user knob coerced 0.8–1.2)
 )
 insulin_to_deliver = aggression_budget × meal_action_multiplier(state)
 ```
@@ -486,28 +525,76 @@ V5 explicitly **dropped** three multipliers from earlier proposals:
 
 ### Observability — fields V5 emits to NS
 
+V5 emits **17** `boostV5_*` fields to Nightscout deviceStatus (`RT.kt:91-123`).
+The core reasoning fields:
+
 ```
 boostV5_score        meal_signal_score (0–1)
 boostV5_state        IDLE | OBSERVING | CONFIRMED | COMMITTED | RECOVERING
 boostV5_age          cycles in current state
 boostV5_budget       aggression_budget (U)
 boostV5_actionMult   meal_action_multiplier
+boostV5_finalDose    V5's would-have-delivered SMB (U)
 boostV5_gateReduction comma-separated summary of which Phase 3 gates fired
 ```
 
-The observability test verifies that any V5 cycle is fully reconstructable
-from these 6 fields plus the per-cycle inputs (within 0.05U dose tolerance
-due to the SMB rounding step).
+Plus (2026-06/07 additions): `boostV5_active` (V5 was the ACTIVE doser),
+`boostV5_committedCap` / `boostV5_confirmedCap` (per-user dose caps),
+`boostV5_confirmGate` / `boostV5_prospectiveShot` / `boostV5_aggressionKnob`
+(dose-adequacy gate telemetry), `boostV5_postRescueWindow`,
+`boostV5_floorWouldAdd` (composed-floor uplift), and
+`boostV5_cumulativeCapU` / `boostV5_smbVol60Min` (rolling-60-min cap).
+
+Persisted state, by contrast, is a small ~5-field blob (`V5PersistedState`
+wrapping `MealHypothesisState`), not the full 17. The observability test verifies
+that a V5 cycle is reconstructable from the emitted fields plus the per-cycle
+inputs (within 0.05U dose tolerance due to the SMB rounding step).
 
 ### Plugin status
 
-| Aspect | V1 | V5 |
+Two selectable plugins share one engine. **"Boost V6" (`OpenAPSBoostV5Plugin`) is
+a user-selectable production APS that doses when selected.** The shadow path is the
+OTHER plugin — plain "Boost" (`OpenAPSBoostPlugin`), which runs the same engine with
+`v5Active=false` so the V6 decision is computed and logged but never dosed.
+
+| Aspect | "Boost" plugin (V1 engine) | "Boost V6" plugin |
 |---|---|---|
 | Plugin class | `OpenAPSBoostPlugin` | `OpenAPSBoostV5Plugin` |
 | Plugin folder | `openAPSBoost/` | `openAPSBoostV5/` |
-| User-selectable as APS? | Yes | **No** — `showInList { false }`, `isEnabled() = false` |
-| Dosing? | Yes (when selected) | **No** — sidecar shadow only |
-| Currently runs? | Only if user selects it as APS | During development testing, alongside the active Boost variant — V5 is invoked at the end of the active variant's cycle |
+| User-selectable as APS? | Yes | **Yes** — `showInList { config.APS }` (`OpenAPSBoostV5Plugin.kt:112`) |
+| Dosing? | Yes (when selected) — V1 dosing, with the V6 decision computed in shadow (`v5Active=false`) and logged to NS, never dosed | **Yes** — runs the engine with `v5Active=true` so the state machine's SMB override drives dosing (`OpenAPSBoostV5Plugin.kt:132-138`) |
+| Role of the OTHER plugin | Is the shadow host — every cycle hands its inputs to V5, which logs `boostV5_*` without affecting the delivered dose | Is the production doser — inherits the full engine/sensitivity stack via `OapsProfileBoost` |
+
+
+## Mechanisms added since this doc was written
+
+The core design above is unchanged, but several mechanisms landed after the
+original write-up. Brief inventory (see the cited source for detail):
+
+- **Composed brake-floor (now activatable).** A floor on the *composed* Phase-3
+  multiplier stack: `finalDose = max(pipeline, flooredDose)` where the floored dose
+  is `min(budget × PHASE3_COMPOSED_FLOOR, committedCapU)`
+  (`DetermineBasalBoostV5.kt:315-343`). Gated by a `composedFloorActive` toggle
+  (OFF = shadow, logs `boostV5_floorWouldAdd` only) AND an **enforced 14-day
+  hypo-gate** `composedFloorAllowedByTbr` — engages only if trailing-14d TBR<63 <
+  2.0% AND TBR<70 < 3.5%, fail-closed on missing data
+  (`DetermineBasalBoostV5.kt:508-524`).
+- **Simple-Mode mask bypass.** V5 reads its dosing prefs via `getBoostDosing`
+  (`BoostDosingPreferences.kt:37-41`), which reads the raw stored value rather than
+  the Simple-Mode-masked default, so V5 state/caps survive Simple Mode
+  (`V5StateStore.kt:58-61`).
+- **Fast-carb fast-path** — single-cycle CONFIRMED on a sharp corroborated rise
+  (`MealHypothesis.kt:174-207`).
+- **Single-CONFIRMED-per-session lock** (`committedInSession`) — one commit-shot per
+  meal (Fix 6, `MealHypothesis.kt:54-66`).
+- **Sustained-score early-confirm** — age gate opens one cycle early on a sustained
+  ready score (`MealHypothesis.kt:107-121`).
+- **RECOVERING → COMMITTED re-engage** — two-phase meals resume 1.0× sustained
+  dosing instead of dribbling at 0.4× (Fix 7, `MealHypothesis.kt:162-172`).
+- **Dose-adequacy confirm gate + confirm-floor pin** — the commit-shot must beat one
+  routine COMMITTED hold; the floor's committedCap term is pinned at the factory
+  default 0.5 U so raising committedCap can't silently tighten the confirm gate
+  (`MealHypothesis.kt:122-155`).
 
 
 ## Related documents

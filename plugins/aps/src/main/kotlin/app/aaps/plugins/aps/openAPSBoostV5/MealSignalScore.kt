@@ -56,8 +56,22 @@ internal const val SUSTAINED_RISE_NORMALIZE_HI_MGDL = 60.0
  */
 internal const val ML_MEAL_RENORMALIZE_AFTER_CYCLES = 3
 
-/** Rescale factor when the mlMealLikely weight is dropped after a long null streak. */
-internal const val ML_MEAL_RENORMALIZE_FACTOR = 1.0 / (1.0 - SCORE_WEIGHT_ML_MEAL_LIKELY)
+/** Sum of all seven score weights. NOT 1.0 — the 2026-05/06 calibration retunes adjusted
+ *  individual weights (and Fix 4 added sustainedRise) without renormalizing the total. */
+internal const val SCORE_WEIGHT_TOTAL =
+    SCORE_WEIGHT_DELTA + SCORE_WEIGHT_DELTA_ACCL + SCORE_WEIGHT_ML_MEAL_LIKELY +
+        SCORE_WEIGHT_NOT_RECENTLY_LOW + SCORE_WEIGHT_MEAL_TIME_OF_DAY +
+        SCORE_WEIGHT_NOT_EXERCISING + SCORE_WEIGHT_SUSTAINED_RISE
+
+/**
+ * Rescale factor when the mlMealLikely weight is dropped after a long null streak.
+ * 2026-07-06 parity fix: was 1/(1−W) = 1.25, which assumes the weights sum to 1.0 — they sum
+ * to [SCORE_WEIGHT_TOTAL] (1.07), so the correct restore-scale is TOTAL/(TOTAL−W) ≈ 1.2299.
+ * The old value over-scaled ML-outage scores by ~1.6% (marginally earlier confirms exactly when
+ * the ML input was missing). The Trio port had already corrected this; Android now matches.
+ */
+internal const val ML_MEAL_RENORMALIZE_FACTOR =
+    SCORE_WEIGHT_TOTAL / (SCORE_WEIGHT_TOTAL - SCORE_WEIGHT_ML_MEAL_LIKELY)
 
 /** Per-component values that went into the final score. Emitted to NS for observability. */
 data class ScoreComponents(

@@ -463,7 +463,7 @@ canvas {
 <header>
   <div>
     <h1>Boost <span>Settings Simulator</span></h1>
-    <p>Live calculation of ISF, SMB size, and aggressiveness as you tweak settings</p>
+    <p>Experimental research tool — not medical advice. Illustrative maths only, not a body simulation.</p>
   </div>
   <div id="ns-live-bar">
     <div class="ns-live-dot"></div>
@@ -472,10 +472,8 @@ canvas {
     <button onclick="disconnectNs()" style="color:#f87171">Disconnect</button>
   </div>
   <div class="tab-bar">
-    <div class="tab active" onclick="switchTab('isf')">ISF &amp; SMB</div>
-    <div class="tab" onclick="switchTab('curve')">ISF Curve</div>
-    <div class="tab" onclick="switchTab('smb')">SMB Deep Dive</div>
-    <div class="tab" onclick="switchTab('proj')">BG Projection</div>
+    <div class="tab active" id="tabbtn-v1" onclick="switchTab('v1')">Boost V1</div>
+    <div class="tab" id="tabbtn-v6" onclick="switchTab('v6')">Boost V6</div>
   </div>
 </header>
 
@@ -537,6 +535,21 @@ canvas {
         <div class="ctrl-hints"><span>-1 U</span><span>15 U</span></div>
       </div>
       <div class="ctrl">
+        <div class="ctrl-label"><span class="ctrl-name">Max IOB</span><span class="ctrl-val" id="v-maxIob">1.0 U</span></div>
+        <input type="range" id="s-maxIob" min="0.1" max="12" step="0.1" value="1.0" oninput="update()">
+        <div class="ctrl-hints"><span>0.1 U</span><span>V6 sees min(Boost, AAPS) maxIOB</span></div>
+      </div>
+      <div class="ctrl">
+        <div class="ctrl-label"><span class="ctrl-name">Lowest BG in last 60 min</span><span class="ctrl-val" id="v-recentLowBg">120 mg/dL</span></div>
+        <input type="range" id="s-recentLowBg" min="40" max="200" step="1" value="120" oninput="update()">
+        <div class="ctrl-hints"><span>40 (recent hypo)</span><span>200 (no recent low)</span></div>
+      </div>
+      <div class="ctrl">
+        <div class="ctrl-label"><span class="ctrl-name">Cumulative 60-min SMB cap</span><span class="ctrl-val" id="v-cumSmbCap">10 U</span></div>
+        <input type="range" id="s-cumSmbCap" min="0" max="10" step="0.5" value="10" oninput="update()">
+        <div class="ctrl-hints"><span>0 = disabled</span><span>10 U / rolling hour</span></div>
+      </div>
+      <div class="ctrl">
         <div class="ctrl-label"><span class="ctrl-name">Insulin peak (min)</span><span class="ctrl-val" id="v-peak">55 min</span></div>
         <input type="range" id="s-peak" min="30" max="75" step="1" value="55" oninput="update()">
         <div class="ctrl-hints"><span>30 (fast)</span><span>75 (slow)</span></div>
@@ -566,9 +579,10 @@ canvas {
         <div class="ctrl-hints"><span>100</span><span>300 mg/dL</span></div>
       </div>
       <div class="ctrl">
-        <div class="ctrl-label"><span class="ctrl-name">BG Velocity (V1 only)</span><span class="ctrl-val" id="v-velocity">100%</span></div>
+        <div class="ctrl-label"><span class="ctrl-name">BG Velocity</span><span class="ctrl-val" id="v-velocity">100%</span></div>
         <input type="range" id="s-velocity" min="0" max="100" step="1" value="100" oninput="update()">
         <div class="ctrl-hints"><span>0% (flat)</span><span>100% (BG-reactive)</span></div>
+        <div class="ctrl-hints"><span>V1 formula — V6 inherits the resulting ISF; V2 fixed at 100%</span></div>
       </div>
       <div class="ctrl">
         <div class="ctrl-label"><span class="ctrl-name">TDD Adjustment Factor</span><span class="ctrl-val" id="v-tddAdj">100%</span></div>
@@ -596,10 +610,10 @@ canvas {
     </div>
   </div>
 
-  <!-- SMB Controls -->
-  <div class="section">
+  <!-- SMB Controls (V1 tab only) -->
+  <div class="section sec-v1">
     <div class="section-header" onclick="toggleSection(this)">
-      <span>💉 SMB Controls</span>
+      <span>💉 SMB Controls (V1)</span>
       <span class="chevron">▾</span>
     </div>
     <div class="section-body">
@@ -607,11 +621,6 @@ canvas {
         <div class="ctrl-label"><span class="ctrl-name">Boost Scale</span><span class="ctrl-val" id="v-scale">1.0</span></div>
         <input type="range" id="s-scale" min="0.1" max="2.99" step="0.05" value="1.0" oninput="update()">
         <div class="ctrl-hints"><span>0.1 (weak)</span><span>≥3 disables Boost</span></div>
-      </div>
-      <div class="ctrl">
-        <div class="ctrl-label"><span class="ctrl-name">Max IOB</span><span class="ctrl-val" id="v-maxIob">1.0 U</span></div>
-        <input type="range" id="s-maxIob" min="0.1" max="12" step="0.1" value="1.0" oninput="update()">
-        <div class="ctrl-hints"><span>0.1 U</span><span>12 U</span></div>
       </div>
       <div class="ctrl">
         <div class="ctrl-label"><span class="ctrl-name">Bolus Cap</span><span class="ctrl-val" id="v-bolusMax">2.5 U</span></div>
@@ -645,8 +654,8 @@ canvas {
     </div>
   </div>
 
-  <!-- Boost V6 Engine -->
-  <div class="section">
+  <!-- Boost V6 Engine (V6 tab only) -->
+  <div class="section sec-v6">
     <div class="section-header" onclick="toggleSection(this)">
       <span>🤖 Boost V6 Engine</span>
       <span class="chevron">▾</span>
@@ -654,7 +663,8 @@ canvas {
     <div class="section-body">
       <p style="font-size:0.7rem; color:#64748b; line-height:1.5; margin-bottom:10px;">
         V6 keeps V1's ISF and replaces the 8-tier SMB with a meal state-machine:
-        <b style="color:#cbd5e1">dose = budget × multiplier(state)</b>. Just 3 user knobs.
+        <b style="color:#cbd5e1">dose = budget × multiplier(state)</b>.
+        In the app these settings are auto-seeded from your own 14-day history on first activation.
       </p>
       <div class="ctrl">
         <div class="ctrl-label"><span class="ctrl-name">Aggression</span><span class="ctrl-val" id="v-v6Aggression">1.0</span></div>
@@ -671,6 +681,20 @@ canvas {
         <input type="range" id="s-v6Sensitivity" min="0.8" max="1.2" step="0.05" value="1.0" oninput="update()">
         <div class="ctrl-hints"><span>0.8 (runs hot)</span><span>1.2 (resistant)</span></div>
       </div>
+      <div class="ctrl">
+        <div class="ctrl-label"><span class="ctrl-name">Confirmed cap</span><span class="ctrl-val" id="v-confirmedCap">2.5 U</span></div>
+        <input type="range" id="s-confirmedCap" min="0" max="7.5" step="0.1" value="2.5" oninput="update()">
+        <div class="ctrl-hints"><span>0 U</span><span>7.5 U — caps the CONFIRMED commit-shot</span></div>
+      </div>
+      <div class="ctrl">
+        <div class="ctrl-label"><span class="ctrl-name">Committed cap</span><span class="ctrl-val" id="v-committedCap">0.5 U</span></div>
+        <input type="range" id="s-committedCap" min="0" max="2.5" step="0.05" value="0.5" oninput="update()">
+        <div class="ctrl-hints"><span>0 U</span><span>2.5 U — per-cycle COMMITTED hold cap</span></div>
+      </div>
+      <div class="toggle-row" style="margin-top:4px">
+        <span class="toggle-label">Fast-carb confirm enabled (pref, default ON)</span>
+        <label class="toggle"><input type="checkbox" id="t-fastCarbConfirm" checked onchange="update()"><div class="toggle-slider"></div></label>
+      </div>
       <div class="ctrl" style="margin-top:6px">
         <div class="ctrl-label"><span class="ctrl-name">ML Meal Likelihood</span><span class="ctrl-val" id="v-mlMealLikely">0%</span></div>
         <input type="range" id="s-mlMealLikely" min="0" max="100" step="1" value="0" oninput="update()">
@@ -682,8 +706,12 @@ canvas {
         <div class="ctrl-hints"><span>0</span><span>100% — damps the budget</span></div>
       </div>
       <div class="toggle-row" style="margin-top:4px">
-        <span class="toggle-label">No ML (model null → renormalize)</span>
+        <span class="toggle-label">ML model unavailable (null this cycle)</span>
         <label class="toggle"><input type="checkbox" id="t-noMl" onchange="update()"><div class="toggle-slider"></div></label>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">…unavailable for 3+ cycles (→ renormalize weights)</span>
+        <label class="toggle"><input type="checkbox" id="t-mlNull3" onchange="update()"><div class="toggle-slider"></div></label>
       </div>
       <div class="toggle-row" style="margin-top:4px">
         <span class="toggle-label">In post-exercise window (×0.5)</span>
@@ -743,7 +771,7 @@ canvas {
         <label class="toggle"><input type="checkbox" id="t-nightMode" onchange="update()"><div class="toggle-slider"></div></label>
       </div>
       <div class="toggle-row">
-        <span class="toggle-label">Currently in night window</span>
+        <span class="toggle-label">Sleep detected — night mode engaged (in the app this comes from HR/step sleep detection, not a clock window)</span>
         <label class="toggle"><input type="checkbox" id="t-nightActive" onchange="update()"><div class="toggle-slider"></div></label>
       </div>
       <div class="ctrl" style="margin-top:8px">
@@ -765,10 +793,6 @@ canvas {
         <div class="ctrl-label"><span class="ctrl-name">Carb ratio (g/U)</span><span class="ctrl-val" id="v-cr">10 g/U</span></div>
         <input type="range" id="s-cr" min="3" max="30" step="0.5" value="10" oninput="update()">
         <div class="ctrl-hints"><span>3</span><span>30 g/U</span></div>
-      </div>
-      <div class="toggle-row">
-        <span class="toggle-label">Recent low BG (&lt;100) in last 60 min</span>
-        <label class="toggle"><input type="checkbox" id="t-recentLow" onchange="update()"><div class="toggle-slider"></div></label>
       </div>
       <div class="toggle-row">
         <span class="toggle-label">Disable Night Mode if COB &gt; 0</span>
@@ -836,8 +860,8 @@ canvas {
 <!-- ════════════════════════════════════════════════════════ -->
 <div class="main">
 
-  <!-- ── ISF & SMB tab ── -->
-  <div class="tab-page active" id="tab-isf">
+  <!-- ── Boost V1 tab ── -->
+  <div class="tab-page active" id="tab-v1">
 
     <!-- Status row -->
     <div id="status-row" class="status-row"></div>
@@ -948,39 +972,6 @@ canvas {
       </div>
     </div>
 
-    <!-- V1 vs V6 side-by-side -->
-    <div class="card">
-      <div class="card-title">
-        V1 tiers vs V6 engine — same insulinReq, different SMB
-        <span class="badge" style="background:rgba(56,189,248,0.15); color:#38bdf8;">SIDE-BY-SIDE</span>
-      </div>
-      <p style="font-size:0.72rem; color:#64748b; margin-bottom:12px; line-height:1.5;">
-        Both start from the <b style="color:#94a3b8">same insulinReq</b> (<span id="out-cmp-basereq">—</span> U). V1 routes it through the 8-tier ladder; V6 runs the meal state-machine and doses <b style="color:#94a3b8">budget × multiplier</b>.
-      </p>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-        <!-- V1 column -->
-        <div style="border:1px solid #334155; border-radius:10px; padding:12px 14px; background:rgba(96,165,250,0.05);">
-          <div style="font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.6px; color:#60a5fa; margin-bottom:6px;">Boost V1 (tiers)</div>
-          <div style="font-size:0.78rem; color:#cbd5e1; min-height:2.4em;" id="out-cmp-v1-tier">—</div>
-          <div style="display:flex; align-items:baseline; gap:4px; margin-top:8px;">
-            <span style="font-size:1.9rem; font-weight:800; color:#60a5fa;" id="out-cmp-v1-dose">—</span>
-            <span style="font-size:0.78rem; color:#64748b;">U SMB</span>
-          </div>
-        </div>
-        <!-- V6 column -->
-        <div style="border:1px solid #334155; border-radius:10px; padding:12px 14px; background:rgba(167,139,250,0.05);">
-          <div style="font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.6px; color:#a78bfa; margin-bottom:6px;">Boost V6 (state machine)</div>
-          <div style="font-size:0.78rem; color:#cbd5e1; min-height:2.4em;" id="out-cmp-v6-state">—</div>
-          <div style="display:flex; align-items:baseline; gap:4px; margin-top:8px;">
-            <span style="font-size:1.9rem; font-weight:800; color:#a78bfa;" id="out-cmp-v6-dose">—</span>
-            <span style="font-size:0.78rem; color:#64748b;">U SMB</span>
-          </div>
-        </div>
-      </div>
-      <div style="margin-top:12px; text-align:center; font-size:0.82rem; font-weight:600;" id="out-cmp-delta">—</div>
-      <div style="margin-top:12px; padding:10px 14px; background:#0f1117; border:1px solid #2d3748; border-radius:8px; font-size:0.74rem; color:#94a3b8; line-height:1.7;" id="out-v6-breakdown">—</div>
-    </div>
-
     <!-- Aggressiveness gauge -->
     <div class="card">
       <div class="card-title">Overall Aggressiveness</div>
@@ -1001,11 +992,7 @@ canvas {
       <div class="reason-box" id="out-reason">—</div>
     </div>
 
-  </div><!-- /tab-isf -->
-
-
-  <!-- ── ISF Curve tab ── -->
-  <div class="tab-page" id="tab-curve">
+    <!-- ── ISF curves ── -->
     <div class="card">
       <div class="card-title">
         ISF vs Blood Glucose — Current Settings
@@ -1036,11 +1023,7 @@ canvas {
         <span style="color:#6ee7b7; opacity:0.7">── 1.0 (= profile)</span>
       </div>
     </div>
-  </div><!-- /tab-curve -->
-
-
-  <!-- ── SMB Deep Dive tab ── -->
-  <div class="tab-page" id="tab-smb">
+    <!-- ── SMB deep dive ── -->
     <div class="card">
       <div class="card-title">SMB Size vs BG (at current basal &amp; settings)</div>
       <p style="font-size:0.75rem; color:#64748b; margin-bottom:12px;">
@@ -1053,29 +1036,99 @@ canvas {
       <div class="card-title">How Settings Affect Max SMB</div>
       <div id="out-smb-sensitivity" style="font-size:0.8rem; color:#94a3b8; line-height:1.9;">—</div>
     </div>
-  </div><!-- /tab-smb -->
-
-  <!-- ── BG Projection tab ── -->
-  <div class="tab-page" id="tab-proj">
+    <!-- ── V1 BG projection ── -->
     <div class="card">
       <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
-        <span>BG Projection — Last 30 min + Next 60 min</span>
-        <span id="proj-data-source" style="font-size:0.72rem; color:#64748b; font-weight:400;"></span>
+        <span>V1 BG Projection — Last 30 min + Next 60 min</span>
+        <span id="proj-data-source-v1" style="font-size:0.72rem; color:#64748b; font-weight:400;"></span>
       </div>
       <p style="font-size:0.75rem; color:#64748b; margin-bottom:12px; line-height:1.5;">
-        <span style="color:#94a3b8; font-weight:600;">—— Grey</span>: trend only &nbsp;·&nbsp;
-        <span style="color:#10b981; font-weight:600;">—— Green</span>: V1 tiers &nbsp;·&nbsp;
-        <span style="color:#fbbf24; font-weight:600;">—— Amber</span>: V6 engine &nbsp;·&nbsp;
-        <span style="color:#a78bfa; font-weight:600;">▲</span> V1 SMB &nbsp;·&nbsp;
-        <span style="color:#fbbf24; font-weight:600;">▼</span> V6 SMB
+        <span style="color:#94a3b8; font-weight:600;">—— Grey</span>: trend only (no SMBs) &nbsp;·&nbsp;
+        <span style="color:#10b981; font-weight:600;">—— Green</span>: with V1 tier SMBs &nbsp;·&nbsp;
+        <span style="color:#a78bfa; font-weight:600;">▲</span> V1 SMB
       </p>
-      <canvas id="projChart" style="width:100%; height:320px;"></canvas>
+      <canvas id="projChartV1" style="width:100%; height:320px;"></canvas>
+      <p style="font-size:0.72rem; color:#64748b; margin-top:10px; font-style:italic;">
+        Illustrative trend arithmetic, not a body simulation — compare doses and states, don't trust the BG numbers.
+      </p>
     </div>
-    <div class="card" id="proj-smb-log-card">
-      <div class="card-title">Projected SMB Delivery</div>
-      <div id="proj-smb-log" style="font-size:0.78rem; color:#94a3b8; line-height:1.9;">—</div>
+    <div class="card">
+      <div class="card-title">Projected V1 SMB Delivery</div>
+      <div id="proj-smb-log-v1" style="font-size:0.78rem; color:#94a3b8; line-height:1.9;">—</div>
     </div>
-  </div><!-- /tab-proj -->
+
+  </div><!-- /tab-v1 -->
+
+  <!-- ── Boost V6 tab ── -->
+  <div class="tab-page" id="tab-v6">
+
+    <!-- V6 status row -->
+    <div id="v6-status-row" class="status-row"></div>
+
+    <!-- State machine panel -->
+    <div class="card">
+      <div class="card-title">
+        Meal State Machine
+        <span class="badge badge-live">LIVE</span>
+      </div>
+      <div id="out-v6-state-banner" style="
+        border-radius:10px; padding:14px 18px; margin-bottom:14px;
+        border:2px solid #334155; background:#1e293b;
+        display:flex; align-items:center; justify-content:space-between; gap:16px;
+      ">
+        <div style="flex:1; min-width:0;">
+          <div style="font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.8px; color:#64748b; margin-bottom:4px;">Meal Hypothesis</div>
+          <div style="font-size:0.92rem; font-weight:700; color:#e2e8f0; line-height:1.3;" id="out-v6-state-name">—</div>
+          <div style="font-size:0.72rem; color:#64748b; margin-top:3px;" id="out-v6-state-why">—</div>
+        </div>
+        <div style="text-align:right; flex-shrink:0;">
+          <div style="font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.8px; color:#64748b; margin-bottom:4px;">Meal Score</div>
+          <div style="font-size:2rem; font-weight:800; line-height:1;" id="out-v6-score">—</div>
+          <div style="font-size:0.72rem; color:#64748b; margin-top:2px;">enter OBS ≥0.44 · confirm peak ≥0.55</div>
+        </div>
+      </div>
+      <div style="padding:10px 14px; background:#0f1117; border:1px solid #2d3748; border-radius:8px; font-size:0.74rem; color:#94a3b8; line-height:1.7;" id="out-v6-state-detail">—</div>
+      <div id="out-v6-confirm-gate" style="margin-top:10px; padding:8px 14px; border-radius:8px; border:1px solid #334155; background:#0f1117; font-size:0.74rem; color:#94a3b8; line-height:1.6;">—</div>
+    </div>
+
+    <!-- V6 dose breakdown -->
+    <div class="card">
+      <div class="card-title">
+        V6 Dose Breakdown
+        <span class="badge badge-live">LIVE</span>
+      </div>
+      <div style="display:flex; align-items:baseline; gap:8px; margin-bottom:10px;">
+        <span style="font-size:2.2rem; font-weight:800; color:#fbbf24;" id="out-v6-dose">—</span>
+        <span style="font-size:0.85rem; color:#64748b;">U SMB this cycle</span>
+      </div>
+      <div style="margin-bottom:12px; padding:8px 14px; background:rgba(96,165,250,0.06); border:1px solid #1d4ed8; border-radius:8px; font-size:0.76rem; color:#93c5fd;" id="out-v6-v1ref">
+        V1 would deliver: — U
+      </div>
+      <div style="padding:10px 14px; background:#0f1117; border:1px solid #2d3748; border-radius:8px; font-size:0.74rem; color:#94a3b8; line-height:1.7;" id="out-v6-breakdown">—</div>
+    </div>
+
+    <!-- V6 BG projection -->
+    <div class="card">
+      <div class="card-title" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>V6 BG Projection — Last 30 min + Next 60 min</span>
+        <span id="proj-data-source-v6" style="font-size:0.72rem; color:#64748b; font-weight:400;"></span>
+      </div>
+      <p style="font-size:0.75rem; color:#64748b; margin-bottom:12px; line-height:1.5;">
+        <span style="color:#94a3b8; font-weight:600;">—— Grey</span>: trend only (no SMBs) &nbsp;·&nbsp;
+        <span style="color:#fbbf24; font-weight:600;">—— Amber</span>: with V6 engine SMBs &nbsp;·&nbsp;
+        <span style="color:#fbbf24; font-weight:600;">▼</span> V6 SMB (state-machine chained cycle-by-cycle)
+      </p>
+      <canvas id="projChartV6" style="width:100%; height:320px;"></canvas>
+      <p style="font-size:0.72rem; color:#64748b; margin-top:10px; font-style:italic;">
+        Illustrative trend arithmetic, not a body simulation — compare doses and states, don't trust the BG numbers.
+      </p>
+    </div>
+    <div class="card">
+      <div class="card-title">Projected V6 SMB Delivery</div>
+      <div id="proj-smb-log-v6" style="font-size:0.78rem; color:#94a3b8; line-height:1.9;">—</div>
+    </div>
+
+  </div><!-- /tab-v6 -->
 
 </div><!-- /main -->
 </div><!-- /app -->
@@ -1150,54 +1203,74 @@ const V6 = {
   // ── MealSignalScore.kt weights (sum 1.07) ──
   W_DELTA: 0.30, W_DELTA_ACCL: 0.16, W_ML: 0.20, W_NOT_LOW: 0.12,
   W_MEAL_TOD: 0.10, W_NOT_EX: 0.04, W_SUSTAINED: 0.15,
-  ML_RENORM_FACTOR: 1.0 / (1.0 - 0.20),  // ≈1.25 when ML weight dropped
+  ML_RENORM_FACTOR: 1.07 / (1.07 - 0.20), // ≈1.2299 — weights sum to 1.07 not 1.0 (2026-07-06 parity fix; matches Kotlin/Trio)
+  ML_RENORM_AFTER_CYCLES: 3,             // renorm only after ≥3 consecutive null-ML cycles
+  NOT_LOW_FLOOR: 0.4,                    // notRecentlyLow floor (continuous term, MealSignalScore.kt:183-186)
   // ── MealHypothesis.kt thresholds ──
   ENTER_OBSERVING: 0.44, CONFIRM_SCORE: 0.55, CONFIRM_OFFSET: 30.0,
   CONFIRM_MIN_AGE: 2, FALLBACK_IDLE_SCORE: 0.36, FALLBACK_IDLE_AGE: 2,
-  RECOVER_DECEL: -5.0, RECOVER_REENGAGE_ACCL: 10.0,
-  // fast-carb fast-path (2026-06-16)
-  FC_DELTA: 8.0, FC_ACCL: 15.0, FC_SCORE: 0.60,
+  RECOVER_DECEL: -5.0, RECOVER_IDLE_SCORE: 0.18,
+  RECOVER_REENGAGE_ACCL: 10.0, RECOVER_REENGAGE_DELTA: 3.0,
+  RECOVER_REENGAGE_OFFSET: 20.0, RECOVER_REENGAGE_MIN_AGE: 1,
+  // fast-carb fast-path (2026-06-16) + post-hypo rescue guard (2026-07-02)
+  // 2026-07-03 retune: Δ 8→6, accl 15→10, score 0.60→0.65 (replay sweep: +21 meals ~9 min earlier, false fires 39%→32%)
+  FC_DELTA: 6.0, FC_ACCL: 10.0, FC_SCORE: 0.65, FC_MIN_RECENT_LOW: 80.0,
+  // 2026-07-02 confirm dose-adequacy gate (DetermineBasalBoostV5.kt:166-169, MealHypothesis.kt:109)
+  CONFIRM_FLOOR_FRAC_OF_CONFIRMED_CAP: 0.8,
+  // 2026-07-06 pin: the committedCap term of the confirm floor is capped at the factory 0.5 so a
+  // user-raised Committed cap can't tighten the confirm gate (MealHypothesis.kt:140,151-155).
+  CONFIRM_FLOOR_COMMITTED_TERM_MAX: 0.5,
   // ── MealActionMultiplier.kt ──
   ACTION: { IDLE: 1.0, OBSERVING: 0.3, CONFIRMED: 1.8, COMMITTED: 1.0, RECOVERING: 0.4 },
   // ── AggressionBudget.kt ──
   BUDGET_FLOOR: 0.30, ML_HYPO_THRESHOLD: 0.30, ML_HYPO_FLOOR: 0.50, POST_EX_SCALE: 0.50,
   // ── DetermineBasalBoostV5.kt dose calibration ──
   VEL_RISE_HI: 50.0, VEL_RISE_LO: 25.0, VEL_FLOOR: 0.40,
-  CAP_CONFIRMED: 1.0, CAP_COMMITTED: 0.25,
+  // Kotlin constant DEFAULTS (MAX_CONFIRMED_COMMIT_DOSE_U / MAX_COMMITTED_DOSE_U); the RUNTIME
+  // caps are the user prefs DoubleKey.ApsBoostV5ConfirmedCapU (default 2.5, 0–7.5) and
+  // ApsBoostV5CommittedCapU (default 0.5, 0–2.5) — surfaced as sliders in this simulator.
+  DEFAULT_CAP_CONFIRMED: 1.0, DEFAULT_CAP_COMMITTED: 0.25,
   // ── SafetyGates.kt ──
   IOB_T0: 0.50, IOB_T1: 0.70, IOB_T2: 0.85,
   IOB_S1: 0.85, IOB_S2: 0.60, IOB_S3: 0.40,
   DECEL_FULL: -15.0, DECEL_FLOOR: 0.30, DECEL_VEL_FALLBACK: 8.0,
-  MIN_GUARD: 80.0, SPIKE_CAP_MULT: 2.5,
+  MAX_DELTA_RATIO: 0.30,           // maxDelta > 0.30 × bg hard-disables (SafetyGates.kt:121-123)
+  DEFAULT_LGS_THRESHOLD: 80.0,     // minGuard threshold = lgsThreshold (default 80)
+  SPIKE_CAP_MULT: 2.5,
 };
 
 function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+function clipNorm(v, lo, hi) { return hi <= lo ? 0 : Math.max(0, Math.min(1, (v - lo) / (hi - lo))); }
 
 // Phase 1.a — meal_signal_score (MealSignalScore.kt)
+// Returns { score, renorm, terms }. ML weight is dropped + renormalized ONLY after ≥3
+// consecutive null-ML cycles (mlNullStreak); a briefly-null model contributes 0 at full weights.
 function v6MealScore(m) {
-  const deltaTerm    = clamp01(m.delta / 20.0);
-  const deltaAcclTerm= clamp01(m.deltaAccl / 30.0);
-  const notLowTerm   = m.recentLow ? 0.4 : 1.0;
+  const deltaTerm    = clipNorm(m.delta, 0, 20.0);
+  const deltaAcclTerm= clipNorm(m.deltaAccl, 0, 30.0);
+  // Continuous notRecentlyLow: max(0.4, clipNormalize(recentLowBg, 70, 100))
+  const notLowTerm   = Math.max(V6.NOT_LOW_FLOOR, clipNorm(m.recentLowBg, 70.0, 100.0));
   const todTerm      = v6MealTimeOfDay(m.hour);
   const notExTerm    = m.exercising ? 0.0 : 1.0;
-  const sustainedTerm= clamp01((m.cumRise30 - 20.0) / 40.0);
+  const sustainedTerm= clipNorm(m.cumRise30, 20.0, 60.0);
   const mlNull = (m.mlMealLikely == null);
-  // 5-feature partial sum (everything except ML)
+  const renorm = mlNull && (m.mlNullStreak || 0) >= V6.ML_RENORM_AFTER_CYCLES;
+  // 6-feature partial sum (everything except ML)
   const partial = V6.W_DELTA*deltaTerm + V6.W_DELTA_ACCL*deltaAcclTerm
     + V6.W_NOT_LOW*notLowTerm + V6.W_MEAL_TOD*todTerm
     + V6.W_NOT_EX*notExTerm + V6.W_SUSTAINED*sustainedTerm;
-  let raw;
-  if (mlNull) {
-    raw = V6.ML_RENORM_FACTOR * partial;          // drop ML, rescale the rest
-  } else {
-    raw = partial + V6.W_ML * m.mlMealLikely;
-  }
-  return clamp01(raw);
+  const raw = renorm
+    ? V6.ML_RENORM_FACTOR * partial                       // drop ML, rescale the rest
+    : partial + V6.W_ML * (mlNull ? 0.0 : m.mlMealLikely); // null-but-<3-cycles: term = 0, no rescale
+  return {
+    score: clamp01(raw), renorm,
+    terms: { deltaTerm, deltaAcclTerm, notLowTerm, todTerm, notExTerm, sustainedTerm },
+  };
 }
 
-// Gaussian meal-time-of-day bumps at 08:00, 13:00, 19:00
+// Gaussian meal-time-of-day bumps at 08:00, 13:00, 19:00 (width 2h — MealSignalScore.kt:195-205)
 function v6MealTimeOfDay(hour) {
-  const peaks = [8, 13, 19], sigma = 1.5;
+  const peaks = [8, 13, 19], sigma = 2.0;
   let best = 0;
   peaks.forEach(p => {
     const g = Math.exp(-Math.pow(hour - p, 2) / (2 * sigma * sigma));
@@ -1206,42 +1279,80 @@ function v6MealTimeOfDay(hour) {
   return best;
 }
 
-// Phase 1.b — state machine step (MealHypothesis.kt). st carries hysteresis.
+// deltaDeclining helper (MealHypothesis.kt:315-322): strict monotonic decline over the window.
+// The plugin feeds [longAvgDelta, shortAvgDelta, delta] as its 3-point history.
+function v6DeltaDeclining(history) {
+  if (!history || history.length < 3) return false;
+  const tail = history.slice(-3);
+  for (let i = 0; i < tail.length - 1; i++) {
+    if (tail[i] <= tail[i + 1]) return false;
+  }
+  return true;
+}
+
+// Phase 1.b — state machine step (MealHypothesis.kt step()). st carries hysteresis:
+// { state, age, maxScore, maxOffset, committed }.
+// NOTE age semantics match Kotlin: all age gates check the PRE-increment age (age enters a state
+// at 0 and increments on each non-transition cycle), so OBSERVING→CONFIRMED is first possible on
+// the 4th OBSERVING cycle (age ≥ 2 seen on the cycle after the 2nd increment).
 function v6MealStep(st, m) {
-  const s = { ...st };
   const score = m.score;
-  const fastPath = m.delta >= V6.FC_DELTA && m.deltaAccl >= V6.FC_ACCL
-    && score >= V6.FC_SCORE && !m.asleep && !m.exercising;
+  const offset = m.eventualBgOffset;  // eventualBg − targetBg (signed)
+  // fast-carb fast-path: pref toggle AND post-hypo rescue guard (recentLowBg ≥ 80) AND awake,
+  // not exercising, sharp + accelerating + score-corroborated rise.
+  const fcEnabled = m.fastCarbConfirmEnabled && m.recentLowBg >= V6.FC_MIN_RECENT_LOW;
+  const fastPath = fcEnabled && !m.asleep && !m.exercising
+    && m.delta >= V6.FC_DELTA && m.deltaAccl >= V6.FC_ACCL && score >= V6.FC_SCORE;
+  // confirmDoseAdequate: 2026-07-02 dose-adequacy gate, computed by the caller (v6Decide).
+  // Defaults true (fast path and legacy callers unaffected).
+  const doseAdequate = m.confirmDoseAdequate !== false;
+
   switch (st.state) {
     case 'IDLE':
-      if (fastPath)                 { s.state='CONFIRMED'; s.age=0; s.maxScore=score; s.maxOffset=m.eventualBgOffset; s.committed=true; }
-      else if (score >= V6.ENTER_OBSERVING) { s.state='OBSERVING'; s.age=0; s.maxScore=score; s.maxOffset=m.eventualBgOffset; s.committed=false; }
-      break;
-    case 'OBSERVING':
-      s.age = st.age + 1;
-      s.maxScore  = Math.max(st.maxScore, score);
-      s.maxOffset = Math.max(st.maxOffset, m.eventualBgOffset);
-      if (fastPath) { s.state='CONFIRMED'; s.age=0; s.committed=true; }
-      else if (!s.committed && s.age >= V6.CONFIRM_MIN_AGE && s.maxScore >= V6.CONFIRM_SCORE && s.maxOffset >= V6.CONFIRM_OFFSET) {
-        s.state='CONFIRMED'; s.age=0; s.committed=true;
-      } else if (score < V6.FALLBACK_IDLE_SCORE && s.age >= V6.FALLBACK_IDLE_AGE) {
-        s.state='IDLE'; s.age=0; s.maxScore=0; s.maxOffset=0; s.committed=false;
-      }
-      break;
+      if (fastPath) return { state:'CONFIRMED', age:0, maxScore:0, maxOffset:0, committed:true };
+      if (score >= V6.ENTER_OBSERVING) return { state:'OBSERVING', age:0, maxScore:score, maxOffset:offset, committed:false, prevScore:score };
+      return { state:'IDLE', age:st.age + 1, maxScore:0, maxOffset:0, committed:false };
+    case 'OBSERVING': {
+      const newMaxScore = Math.max(st.maxScore, score);
+      const newMaxOffset = Math.max(st.maxOffset, offset);
+      // 2026-07-03 sustained-score early-confirm (MealHypothesis.kt:237-239): the age gate opens one
+      // cycle early when the CURRENT score is ≥ CONFIRM_SCORE and it was also ≥ CONFIRM_SCORE on the
+      // previous cycle (scoreReadyStreak) — a sustained-ready score, not a transient peak.
+      const scoreReadyStreak = st.prevScore != null && st.prevScore >= V6.CONFIRM_SCORE;
+      const ageEligible = st.age >= V6.CONFIRM_MIN_AGE
+        || (st.age >= V6.CONFIRM_MIN_AGE - 1 && score >= V6.CONFIRM_SCORE && scoreReadyStreak);
+      const confirmEligible = ageEligible
+        && newMaxScore >= V6.CONFIRM_SCORE
+        && newMaxOffset >= V6.CONFIRM_OFFSET
+        && doseAdequate
+        && !st.committed;
+      if (fastPath && !st.committed) return { state:'CONFIRMED', age:0, maxScore:0, maxOffset:0, committed:true };
+      if (confirmEligible) return { state:'CONFIRMED', age:0, maxScore:0, maxOffset:0, committed:true };
+      if (score < V6.FALLBACK_IDLE_SCORE && st.age >= V6.FALLBACK_IDLE_AGE)
+        return { state:'IDLE', age:0, maxScore:0, maxOffset:0, committed:false };
+      return { state:'OBSERVING', age:st.age + 1, maxScore:newMaxScore, maxOffset:newMaxOffset, committed:st.committed, prevScore:score };
+    }
     case 'CONFIRMED':
-      s.state='COMMITTED'; s.age=0;        // single-cycle commit (Fix 6)
-      break;
-    case 'COMMITTED':
-      s.age = st.age + 1;
-      if (m.deltaAccl < V6.RECOVER_DECEL && m.delta < m.shortAvgDelta) { s.state='RECOVERING'; s.age=0; }
-      break;
-    case 'RECOVERING':
-      s.age = st.age + 1;
-      if (s.age >= 1 && m.deltaAccl > V6.RECOVER_REENGAGE_ACCL && m.delta > 3 && m.eventualBgOffset > 20) { s.state='COMMITTED'; s.age=0; }
-      else if (m.delta < 0 || score < 0.18) { s.state='IDLE'; s.age=0; s.maxScore=0; s.maxOffset=0; s.committed=false; }
-      break;
+      // CONFIRMED_TO_COMMITTED_AGE = 0 → true single-cycle commit (Fix 6)
+      return { state:'COMMITTED', age:0, maxScore:0, maxOffset:0, committed:true };
+    case 'COMMITTED': {
+      // BOTH required: delta_accl < −5 AND delta strictly declining over 2 cycles
+      const backOff = m.deltaAccl < V6.RECOVER_DECEL && m.deltaDeclining;
+      if (backOff) return { state:'RECOVERING', age:0, maxScore:0, maxOffset:0, committed:true };
+      return { state:'COMMITTED', age:st.age + 1, maxScore:0, maxOffset:0, committed:true };
+    }
+    case 'RECOVERING': {
+      const reEngage = st.age >= V6.RECOVER_REENGAGE_MIN_AGE
+        && m.deltaAccl > V6.RECOVER_REENGAGE_ACCL
+        && m.delta > V6.RECOVER_REENGAGE_DELTA
+        && offset > V6.RECOVER_REENGAGE_OFFSET;
+      if (reEngage) return { state:'COMMITTED', age:0, maxScore:0, maxOffset:0, committed:true };
+      if (m.delta < 0 || score < V6.RECOVER_IDLE_SCORE)
+        return { state:'IDLE', age:0, maxScore:0, maxOffset:0, committed:false };
+      return { state:'RECOVERING', age:st.age + 1, maxScore:0, maxOffset:0, committed:true };
+    }
   }
-  return s;
+  return { ...st };
 }
 
 // Phase 1.c — aggression budget (AggressionBudget.kt)
@@ -1274,25 +1385,42 @@ function v6VelocityFactor(cumRise30) {
   const frac = (cumRise30 - V6.VEL_RISE_LO) / (V6.VEL_RISE_HI - V6.VEL_RISE_LO);
   return V6.VEL_FLOOR + (1.0 - V6.VEL_FLOOR) * frac;
 }
-function v6StateCap(state, dose) {
-  if (state === 'CONFIRMED') return Math.min(dose, V6.CAP_CONFIRMED);
-  if (state === 'COMMITTED') return Math.min(dose, V6.CAP_COMMITTED);
+// State-specific dose caps. Runtime caps come from the user prefs / sliders
+// (confirmedCapU default 2.5, committedCapU default 0.5) — NOT the Kotlin constant defaults.
+function v6StateCap(state, dose, confirmedCapU, committedCapU) {
+  if (state === 'CONFIRMED') return Math.min(dose, confirmedCapU);
+  if (state === 'COMMITTED') return Math.min(dose, committedCapU);
   return dose;
 }
 
-// Phase 3 — ordered safety gates (SafetyGates.kt)
+// Phase 3 — ordered safety gates (SafetyGates.kt applyPhase3, order load-bearing).
+// NOTE: sleep is NOT a Phase-3 gate — it's handled at the override site (v6Override), where the
+// result falls back to V1's base SMB, not 0.
 function v6Gates(dose, m) {
   const gates = [];
   // ── HARD gates (short-circuit to 0) ──
-  if (m.asleep)                    return { dose: 0, hard: 'SLEEPING (sleep-gate → base SMB)', gates };
-  if (!m.microBolusAllowed)        return { dose: 0, hard: 'SMBs not allowed', gates };
-  if (m.iob >= m.maxIob)           return { dose: 0, hard: `IOB ${m.iob.toFixed(1)} ≥ maxIOB ${m.maxIob.toFixed(1)}`, gates };
-  if (m.minGuardBg < V6.MIN_GUARD) return { dose: 0, hard: `minGuard ${Math.round(m.minGuardBg)} < ${V6.MIN_GUARD}`, gates };
-  // ── SOFT gates (ordered, multiplicative) — iobHeadroom FIRST ──
+  if (!m.microBolusAllowed)
+    return { dose: 0, hard: 'enable_smb_pre_checks (SMBs not allowed)', gates };
+  const lgs = m.lgsThreshold != null ? m.lgsThreshold : V6.DEFAULT_LGS_THRESHOLD;
+  if (m.minGuardBg < lgs)
+    return { dose: 0, hard: `minGuardBG ${Math.round(m.minGuardBg)} < lgsThreshold ${Math.round(lgs)}`, gates };
+  if (m.maxDelta > V6.MAX_DELTA_RATIO * m.bg)
+    return { dose: 0, hard: `maxDelta ${m.maxDelta.toFixed(1)} > 0.30×BG ${(V6.MAX_DELTA_RATIO * m.bg).toFixed(1)}`, gates };
+  // ── IOB headroom clamp: dose = min(dose, maxIob − iob) (SafetyGates.kt:125-131) ──
   let d = dose;
+  const headroom = Math.max(0, m.maxIob - m.iob);
+  let maxIobClamped = false;
+  if (d > headroom) {
+    d = headroom; maxIobClamped = true;
+    gates.push(`maxIOB headroom clamp → ${headroom.toFixed(2)}U`);
+  }
+  // ── SOFT gates (ordered, multiplicative) — iobHeadroomBrake FIRST ──
   const frac = m.maxIob > 0 ? m.iob / m.maxIob : 0;
   const iobBrake = frac < V6.IOB_T0 ? 1.0 : frac < V6.IOB_T1 ? V6.IOB_S1 : frac < V6.IOB_T2 ? V6.IOB_S2 : V6.IOB_S3;
-  if (iobBrake < 1.0) { gates.push(`IOB-headroom ×${iobBrake.toFixed(2)}`); d *= iobBrake; }
+  if (iobBrake < 1.0) { gates.push(`IOB-headroom brake ×${iobBrake.toFixed(2)}`); d *= iobBrake; }
+  // postActionRiskCheck runs here in Kotlin (wired live via riskAtProjectedIob, OpenAPSBoostV5Plugin
+  // :407-412) but with the v12 risk model it effectively never fires — the projected-risk delta
+  // never exceeds the +0.15 trigger at SMB-scale IOB changes — so the simulator omits it.
   // deceleration brake (V1-anchored ease-off)
   let decel = 1.0;
   if (!(m.delta > V6.DECEL_VEL_FALLBACK || m.deltaAccl >= 0)) {
@@ -1307,103 +1435,87 @@ function v6Gates(dose, m) {
   d = Math.floor(d / 0.05 + 1e-9) * 0.05;
   const spikeCap = V6.SPIKE_CAP_MULT * m.baseInsulinReq;
   let spikeCapped = false;
-  if (d > spikeCap) { d = Math.floor(spikeCap / 0.05) * 0.05; spikeCapped = true; gates.push(`spike-cap ${spikeCap.toFixed(2)}U`); }
+  if (d > spikeCap) { d = spikeCap; spikeCapped = true; gates.push(`spike-cap ${spikeCap.toFixed(2)}U`); }
   d = Math.max(0, d);
-  return { dose: d, hard: null, gates, iobBrake, decel, spikeCapped };
+  return { dose: d, hard: null, gates, iobBrake, decel, spikeCapped, maxIobClamped };
 }
 
 // Top-level V6 decision. baseInsulinReq = V1's insulinReq (same starting point as the tiers).
 // prevState = MealHypothesisState; returns the new state so the projection can chain cycles.
+// knobs = { aggression, hypoCaution, sensitivity, confirmedCap, committedCap }.
+// Mirrors DetermineBasalBoostV5.decide(): budget is hoisted BEFORE the state step so the
+// OBSERVING→CONFIRMED dose-adequacy gate can size the prospective (velocity-scaled) commit-shot.
 function v6Decide(baseInsulinReq, m, prevState, knobs) {
-  const score = v6MealScore(m);
-  const stepIn = { ...m, score };
+  const confirmedCap = knobs.confirmedCap != null ? knobs.confirmedCap : V6.DEFAULT_CAP_CONFIRMED;
+  const committedCap = knobs.committedCap != null ? knobs.committedCap : V6.DEFAULT_CAP_COMMITTED;
+  const scoreRes = v6MealScore(m);
+  const score = scoreRes.score;
+  const bud = v6Budget(baseInsulinReq, m.mlHypoRisk, m.inPostEx, knobs);
+  const velFactor = v6VelocityFactor(m.cumRise30);
+  // 2026-07-02 confirm dose-adequacy gate: the DELIVERED shot (incl. velocity scaling) must beat
+  // min(committedCapU, 0.8 × confirmedCapU) or the per-session confirm token isn't spent.
+  const prospectiveShot = bud.budget * v6ActionMult('CONFIRMED', knobs.aggression) * velFactor;
+  const confirmFloor = Math.min(Math.min(committedCap, V6.CONFIRM_FLOOR_COMMITTED_TERM_MAX), V6.CONFIRM_FLOOR_FRAC_OF_CONFIRMED_CAP * confirmedCap);
+  const confirmDoseAdequate = prospectiveShot > confirmFloor;
+  const deltaDeclining = m.deltaDeclining != null ? m.deltaDeclining : v6DeltaDeclining(m.deltaHistory);
+  const stepIn = { ...m, score, confirmDoseAdequate, deltaDeclining };
   const newState = v6MealStep(prevState, stepIn);
   const st = newState.state;
-  const bud = v6Budget(baseInsulinReq, m.mlHypoRisk, m.inPostEx, knobs);
   const actionMult = v6ActionMult(st, knobs.aggression);
   const rawDose = bud.budget * actionMult;
-  const velFactor = v6VelocityFactor(m.cumRise30);
   const velScaled = rawDose * velFactor;
-  const capped = v6StateCap(st, velScaled);
+  const capped = v6StateCap(st, velScaled, confirmedCap, committedCap);
+  const stateCapped = capped < velScaled - 1e-9;
   const gated = v6Gates(capped, m);
   return {
-    state: st, prevState: prevState.state, score,
+    state: st, prevState: prevState.state, score, scoreTerms: scoreRes.terms, renorm: scoreRes.renorm,
     budget: bud.budget, mlScale: bud.mlScale, postEx: bud.postEx, sens: bud.sens,
-    actionMult, rawDose, velFactor, velScaled, capped,
-    finalDose: gated.dose, hard: gated.hard, gates: gated.gates, spikeCapped: gated.spikeCapped,
+    actionMult, rawDose, velFactor, velScaled, capped, stateCapped, confirmedCap, committedCap,
+    prospectiveShot, confirmFloor, confirmDoseAdequate,
+    finalDose: gated.dose, hard: gated.hard, gates: gated.gates,
+    spikeCapped: gated.spikeCapped, maxIobClamped: gated.maxIobClamped,
     eventualBgOffset: m.eventualBgOffset, newStateObj: newState,
   };
 }
 
 function v6FreshState() { return { state: 'IDLE', age: 0, maxScore: 0, maxOffset: 0, committed: false }; }
 
-// ════════════════════════════════════════════════════════════
-// Inputs
-// ════════════════════════════════════════════════════════════
-function getInputs() {
-  const g = id => document.getElementById(id);
-  const gf = id => parseFloat(g(id).value);
-  const gb = id => g(id).checked;
-  const gs = id => g(id).value;
-  return {
-    // Patient / insulin
-    tdd:           gf('s-tdd'),
-    profIsf:       gf('s-profIsf'),
-    basal:         gf('s-basal'),
-    bg:            gf('s-bg'),
-    delta:         gf('s-delta'),
-    shortAvgDelta: gf('s-shortAvgDelta'),
-    longAvgDelta:  gf('s-longAvgDelta'),
-    target:        gf('s-target'),
-    iob:           gf('s-iob'),
-    peak:          gf('s-peak'),
-    // Dynamic ISF
-    useTdd:        gb('t-useTdd'),
-    normTarget:    gf('s-normTarget'),
-    bgCap:         gf('s-bgCap'),
-    velocity:      gf('s-velocity') / 100,
-    tddAdj:        gf('s-tddAdj') / 100,
-    adjustSens:    gb('t-adjustSens'),
-    sensRatio:     gf('s-sensRatio'),
-    circadian:     gb('t-circadian'),
-    circHour:      gf('s-circHour'),
-    // SMB Controls
-    scale:         gf('s-scale'),
-    maxIob:        gf('s-maxIob'),
-    bolusMax:      gf('s-bolusMax'),
-    insulinReqPct: gf('s-insulinReqPct') / 100,
-    smbMin:        gf('s-smbMin'),
-    uamSmbMin:     gf('s-uamSmbMin'),
-    percentScale:    gb('t-percentScale'),
-    percentScaleVal: gf('s-percentScale'),      // raw value (e.g. 200), matches Kotlin formula
-    // Activity
-    activityState: gs('s-activityState'),
-    activityPct:   gf('s-activityPct'),
-    inactivityPct: gf('s-inactivityPct'),
-    // Night Mode / COB
-    nightMode:     gb('t-nightMode'),
-    nightActive:   gb('t-nightActive'),
-    nightOffset:   gf('s-nightOffset'),
-    cob:           gf('s-cob'),
-    lastCarbAge:   gf('s-lastCarbAge'),
-    cr:            gf('s-cr'),
-    recentLow:     gb('t-recentLow'),
-    nightModeCob:  gb('t-nightModeCob'),
-    // Temp Target
-    tempTarget:    gb('t-tempTarget'),
-    tempTargetBg:  gf('s-tempTargetBg'),
-    highTtSens:    gb('t-highTtSens'),
-    lowTtSens:     gb('t-lowTtSens'),
-    // Boost V6 engine
-    v6Aggression:  gf('s-v6Aggression'),
-    v6HypoCaution: gf('s-v6HypoCaution'),
-    v6Sensitivity: gf('s-v6Sensitivity'),
-    mlMealLikely:  gf('s-mlMealLikely') / 100,
-    mlHypoRisk:    gf('s-mlHypoRisk') / 100,
-    noMl:          gb('t-noMl'),
-    v6PriorState:  gs('s-v6PriorState'),
-    postExercise:  gb('t-postExercise'),
-  };
+// ── Override site (OpenAPSBoostPlugin.kt:1289-1321) ─────────────────────────
+// The shipped V6 is an SMB OVERRIDE on top of V1: V1 computes its own SMB first (v1WouldDose)
+// and V6 replaces it only when allowed. Consequences modelled here:
+//  • asleep / boost-inactive → the override is SKIPPED and V1's base SMB is delivered (NOT 0 U);
+//  • rolling-60-min cumulative SMB cap reached → 0 U this cycle (cap 0 = disabled);
+//  • non-meal-state cap (2026-07-02): unless state is CONFIRMED or COMMITTED, the V6 dose is
+//    clamped to V1's would-dose — V6 may only OUT-dose V1 when it holds a meal hypothesis;
+//  • post-rescue meal-state cap (2026-07-04): inside the post-rescue window the meal-state
+//    exemption is suppressed — CONFIRMED/COMMITTED are ALSO clamped to V1's would-dose, which
+//    V1's aligned tier guard (same 75 mg/dL threshold) has already hypo-restrained. NOTE: the
+//    app computes the window from a 45-min rolling BG minimum (recentLowBG45Min); the sim only
+//    has the 60-min "Lowest BG" slider, so we model it as recentLowBg < 75 — an approximation
+//    in the conservative direction (a low 45-60 min ago keeps the sim's cap on slightly longer).
+function v6Override(v6dec, v1WouldDose, opts) {
+  opts = opts || {};
+  if (opts.asleep) {
+    return { dose: v1WouldDose, mode: 'sleep', overridden: false, nonMealCapped: false, postRescueCapped: false,
+             note: `V6 override suppressed (sleep/night engaged) — V1 base SMB ${v1WouldDose.toFixed(2)}U delivered` };
+  }
+  if (opts.boostInactive) {
+    return { dose: v1WouldDose, mode: 'boost-inactive', overridden: false, nonMealCapped: false, postRescueCapped: false,
+             note: `V6 override skipped (Boost inactive) — V1 base SMB ${v1WouldDose.toFixed(2)}U retained` };
+  }
+  if (opts.cumSmbCap > 0 && (opts.recentSmbVolume60Min || 0) >= opts.cumSmbCap) {
+    return { dose: 0, mode: 'cum-cap', overridden: true, nonMealCapped: false, postRescueCapped: false,
+             note: `V6 suppressed — cumulative 60-min SMB cap reached (${(opts.recentSmbVolume60Min || 0).toFixed(2)}U ≥ ${opts.cumSmbCap.toFixed(2)}U)` };
+  }
+  const inMealState = v6dec.state === 'CONFIRMED' || v6dec.state === 'COMMITTED';
+  const inPostRescueWindow = opts.recentLowBg != null && opts.recentLowBg < 75;
+  const dose = (inMealState && !inPostRescueWindow) ? v6dec.finalDose : Math.min(v6dec.finalDose, v1WouldDose);
+  const capped = dose < v6dec.finalDose - 1e-9;
+  const postRescueCapped = capped && inMealState;
+  const nonMealCapped = capped && !inMealState;
+  return { dose, mode: 'override', overridden: true, inMealState, inPostRescueWindow, nonMealCapped, postRescueCapped,
+           note: postRescueCapped ? `post-rescue capped from ${v6dec.finalDose.toFixed(2)}U to V1's ${v1WouldDose.toFixed(2)}U (recent low ${opts.recentLowBg.toFixed(0)})`
+               : nonMealCapped   ? `non-meal-capped from ${v6dec.finalDose.toFixed(2)}U to V1's would-dose ${v1WouldDose.toFixed(2)}U (state ${v6dec.state})` : null };
 }
 
 // Build the per-cycle V6 measurement bundle from sim inputs + a calcAll result.
@@ -1411,31 +1523,47 @@ function v6Measurement(inp, r, opts) {
   opts = opts || {};
   const bg          = opts.bg          != null ? opts.bg          : inp.bg;
   const eventualBG  = opts.eventualBG  != null ? opts.eventualBG  : r.eventualBG;
-  const cumRise30   = opts.cumRise30   != null ? opts.cumRise30   : Math.max(0, inp.longAvgDelta * 6);
+  const delta       = opts.delta       != null ? opts.delta       : inp.delta;
+  const shortAvg    = opts.shortAvgDelta != null ? opts.shortAvgDelta : inp.shortAvgDelta;
+  // cumRise30 derived from shortAvgDelta × 6 (OpenAPSBoostV5Plugin.kt:356), clamped ≥ 0
+  const cumRise30   = opts.cumRise30   != null ? opts.cumRise30   : Math.max(0, shortAvg * 6);
   const baseInsReq  = opts.baseInsulinReq != null ? opts.baseInsulinReq : r.insulinReqV1;
   return {
-    delta: opts.delta != null ? opts.delta : inp.delta,
-    shortAvgDelta: opts.shortAvgDelta != null ? opts.shortAvgDelta : inp.shortAvgDelta,
+    bg,
+    delta,
+    shortAvgDelta: shortAvg,
     deltaAccl: opts.deltaAccl != null ? opts.deltaAccl : r.delta_accl,
-    eventualBgOffset: opts.eventualBgOffset != null ? opts.eventualBgOffset : Math.max(0, eventualBG - inp.target),
+    // maxDelta from the plugin = |delta| (OpenAPSBoostV5Plugin.kt:388)
+    maxDelta: opts.maxDelta != null ? opts.maxDelta : Math.abs(delta),
+    // signed eventualBg − targetBg (MealHypothesis peak-tracks the raw offset)
+    eventualBgOffset: opts.eventualBgOffset != null ? opts.eventualBgOffset : (eventualBG - inp.target),
     cumRise30,
+    // 3-point delta history [longAvg, shortAvg, delta] for deltaDeclining, as the plugin feeds it
+    deltaHistory: opts.deltaHistory != null ? opts.deltaHistory : [inp.longAvgDelta, shortAvg, delta],
+    deltaDeclining: opts.deltaDeclining,
     mlMealLikely: inp.noMl ? null : inp.mlMealLikely,
+    mlNullStreak: inp.noMl ? (inp.mlNull3 ? V6.ML_RENORM_AFTER_CYCLES : 1) : 0,
     mlHypoRisk: inp.mlHypoRisk,
-    recentLow: inp.recentLow,
+    recentLowBg: inp.recentLowBg,
+    fastCarbConfirmEnabled: inp.fastCarbConfirm,
     hour: inp.circadian ? inp.circHour : new Date().getHours(),
     exercising: inp.activityState === 'active',
     inPostEx: inp.postExercise,
     asleep: inp.nightMode && inp.nightActive,
     microBolusAllowed: !r.boostDisabledScale,
     iob: opts.iob != null ? opts.iob : inp.iob,
-    maxIob: inp.maxIob,
+    maxIob: inp.maxIob,   // represents min(boostMaxIob, aapsMaxIob) — OpenAPSBoostV5Plugin.kt:401
     minGuardBg: Math.min(bg, eventualBG),
+    lgsThreshold: V6.DEFAULT_LGS_THRESHOLD,
     flatBGs: false,
     baseInsulinReq: baseInsReq,
   };
 }
 function v6Knobs(inp) {
-  return { aggression: inp.v6Aggression, hypoCaution: inp.v6HypoCaution, sensitivity: inp.v6Sensitivity };
+  return {
+    aggression: inp.v6Aggression, hypoCaution: inp.v6HypoCaution, sensitivity: inp.v6Sensitivity,
+    confirmedCap: inp.confirmedCap, committedCap: inp.committedCap,
+  };
 }
 
 function fmt(v, dp=1) {
@@ -1555,16 +1683,19 @@ function calcAll(inp) {
   const uamBoost2 = Math.abs(inp.longAvgDelta) > 0.001 ? Math.abs(inp.delta / inp.longAvgDelta) : 0;
   // Simplified eventualBG: 30-min trend projection using longAvgDelta (6 × 5-min intervals)
   const eventualBG = inp.bg + inp.longAvgDelta * 6;
-  // Graduated fast-carb rebound detection (mirrors DetermineBasalBoost.kt)
+  // Graduated fast-carb rebound detection (mirrors DetermineBasalBoost.kt:1342-1398)
+  const lowTriggered = inp.recentLowBg < 100;                 // recentLowBG < 100 (60-min low)
   const reversalScore = (inp.longAvgDelta < 0 && inp.delta > 0)
     ? inp.delta * Math.abs(inp.longAvgDelta) : 0;
-  const fastCarbConditions = (inp.recentLow || reversalScore > 30)
+  const fastCarbConditions = (lowTriggered || reversalScore > 30)
     && inp.cob === 0 && delta_accl > 25;
   let fastCarbScale = 1.0;
   let fastCarbRebound = false;
   if (fastCarbConditions && inp.bg < 170) {
-    // Velocity override: extreme rise well above target is a genuine spike
-    if (inp.delta > 15 && inp.bg > inp.target + 20) {
+    // Overrides (Layer D + v4.4.3 Fix D): genuine-spike escapes release the damping
+    const velocityOverride = inp.delta > 10;
+    const eventualBgOverride = eventualBG > inp.target + 100 && inp.recentLowBg >= 75;
+    if ((velocityOverride || eventualBgOverride) && inp.bg > inp.target + 20) {
       fastCarbScale = 1.0;
       fastCarbRebound = false;
     } else {
@@ -1572,6 +1703,10 @@ function calcAll(inp) {
       fastCarbRebound = true;
     }
   }
+  // v4.4.4 Fix A v2: post-rescue tier block — blocks T3/T4/T5 while the 45-min rolling-min BG
+  // is < 75 (DetermineBasalBoost.kt:1434-1437). The sim's single "lowest BG in last 60 min"
+  // input stands in for the 45-min window.
+  const inPostRescueWindow = inp.recentLowBg < 75;
 
   // boost_scale = profile.boost_scale × (profileSwitch/100)
   const boost_scale = inp.scale * profileScale;
@@ -1600,8 +1735,8 @@ function calcAll(inp) {
       const cobBoostMax = Math.max((inp.cob / inp.cr) / baseReqDivisor, inp.bolusMax);
       microBolus = Math.floor(Math.min(insulinReqV1 / baseReqDivisor, cobBoostMax) * R) / R;
     }
-    // Tier 3: UAM Boost (strong acceleration)
-    else if (inp.delta >= 5 && inp.shortAvgDelta >= 3
+    // Tier 3: UAM Boost (strong acceleration) — blocked in the post-rescue window
+    else if (!inPostRescueWindow && inp.delta >= 5 && inp.shortAvgDelta >= 3
         && uamBoost1 > 1.2 && uamBoost2 > 2
         && boostActive && inp.iob < boostMaxIOB && boost_scale < 3
         && eventualBG > inp.target && inp.bg > 80 && insulinReqV1 > 0) {
@@ -1616,8 +1751,10 @@ function calcAll(inp) {
       }
       if (fastCarbRebound) microBolus = Math.floor(microBolus * fastCarbScale * R) / R;
     }
-    // Tier 4: UAM High Boost (BG > 180, delta_accl > 5)
-    else if (delta_accl > 5 && inp.bg > 180 && boostActive && inp.iob < boostMaxIOB
+    // Tier 4: UAM High Boost (BG > 180, accelerating OR sustained velocity delta > 8)
+    // — blocked in the post-rescue window (DetermineBasalBoost.kt:1505)
+    else if (!inPostRescueWindow && (delta_accl > 5 || inp.delta > 8) && inp.bg > 180
+        && boostActive && inp.iob < boostMaxIOB
         && boost_scale < 3 && eventualBG > inp.target && inp.bg > 80 && insulinReqV1 > 0) {
       tier = 'T4_UAM_HIGH_BOOST';
       let boostInsReq = Math.min(boost_scale * effectiveBasal, inp.bolusMax);
@@ -1629,8 +1766,9 @@ function calcAll(inp) {
         microBolus = Math.floor(Math.min(boostInsReq, inp.bolusMax) * R) / R;
       }
     }
-    // Tier 5: Percent Scale (BG 110-181, delta > 3, any acceleration)
-    else if (inp.bg > 110 && inp.bg < 181 && inp.delta > 3
+    // Tier 5: Percent Scale (BG 110-180, delta > 3, any acceleration)
+    // — blocked in the post-rescue window (DetermineBasalBoost.kt:1526)
+    else if (!inPostRescueWindow && inp.bg > 110 && inp.bg < 181 && inp.delta > 3
         && delta_accl > 0 && eventualBG > inp.target && inp.iob < boostMaxIOB && boostActive) {
       tier = 'T5_PERCENT_SCALE';
       let insReq = insulinReqV1;
@@ -1643,8 +1781,8 @@ function calcAll(inp) {
       microBolus = Math.floor(Math.min(insReq / div5, inp.bolusMax) * R) / R;
       if (fastCarbRebound) microBolus = Math.floor(microBolus * fastCarbScale * R) / R;
     }
-    // Tier 6: Acceleration Bolus (delta_accl > 25)
-    else if (delta_accl > 25 && inp.delta > 4
+    // Tier 6: Acceleration Bolus (delta_accl > 25, delta > 4, BG > 110)
+    else if (delta_accl > 25 && inp.delta > 4 && inp.bg > 110
         && inp.iob < boostMaxIOB && boostActive && eventualBG > inp.target) {
       tier = 'T6_ACCELERATION';
       let boostInsReq = Math.min(boost_scale * effectiveBasal, inp.bolusMax);
@@ -1690,7 +1828,7 @@ function calcAll(inp) {
     insulinReqV1, scaledDivisor, baseReqDivisor, scale_pct, rawMicroBolus, rawMicroBolusUnscaled, microBolus,
     ioBlock, boostDisabledScale, nightSuppressed,
     ttRatioApplied, circFactor,
-    delta_accl, uamBoost1, uamBoost2, eventualBG, fastCarbRebound, fastCarbScale, tier,
+    delta_accl, uamBoost1, uamBoost2, eventualBG, fastCarbRebound, fastCarbScale, inPostRescueWindow, tier,
     boost_scale,
     aggScore,
   };
@@ -1710,6 +1848,95 @@ function computeAggScore(inp, isfV1, profIsf, maxBasalBolus, profilePct, nightSu
   score += (profilePct - 100) / 100 * 0.1;
   if (nightSuppressed) score -= 0.15;
   return Math.max(0.02, Math.min(0.98, score));
+}
+
+// Aggregate pure-engine surface. Everything above this line is DOM-free; the node test
+// harness loads this script block directly and asserts against ENGINE.
+const ENGINE = {
+  getCircadianSensitivity, calcInsulinDivisor, capBg,
+  calcSensNormalTargetV1, calcSensNormalTargetV2, calcIsfAtBg,
+  V6, clamp01, clipNorm,
+  v6MealScore, v6MealTimeOfDay, v6DeltaDeclining, v6MealStep, v6MlHypoScale, v6Budget,
+  v6ActionMult, v6VelocityFactor, v6StateCap, v6Gates, v6Decide, v6FreshState, v6Override,
+  v6Measurement, v6Knobs,
+  fmt, calcAll, computeAggScore,
+};
+if (typeof module !== 'undefined' && module.exports) module.exports = ENGINE;
+</script>
+
+<script>
+// ════════════════════════════════════════════════════════════
+// UI layer — inputs, rendering, charts, Nightscout (DOM only below this line)
+// ════════════════════════════════════════════════════════════
+function getInputs() {
+  const g = id => document.getElementById(id);
+  const gf = id => parseFloat(g(id).value);
+  const gb = id => g(id).checked;
+  const gs = id => g(id).value;
+  return {
+    // Patient / insulin
+    tdd:           gf('s-tdd'),
+    profIsf:       gf('s-profIsf'),
+    basal:         gf('s-basal'),
+    bg:            gf('s-bg'),
+    delta:         gf('s-delta'),
+    shortAvgDelta: gf('s-shortAvgDelta'),
+    longAvgDelta:  gf('s-longAvgDelta'),
+    target:        gf('s-target'),
+    iob:           gf('s-iob'),
+    peak:          gf('s-peak'),
+    // Dynamic ISF
+    useTdd:        gb('t-useTdd'),
+    normTarget:    gf('s-normTarget'),
+    bgCap:         gf('s-bgCap'),
+    velocity:      gf('s-velocity') / 100,
+    tddAdj:        gf('s-tddAdj') / 100,
+    adjustSens:    gb('t-adjustSens'),
+    sensRatio:     gf('s-sensRatio'),
+    circadian:     gb('t-circadian'),
+    circHour:      gf('s-circHour'),
+    // SMB Controls
+    scale:         gf('s-scale'),
+    maxIob:        gf('s-maxIob'),
+    bolusMax:      gf('s-bolusMax'),
+    insulinReqPct: gf('s-insulinReqPct') / 100,
+    smbMin:        gf('s-smbMin'),
+    uamSmbMin:     gf('s-uamSmbMin'),
+    percentScale:    gb('t-percentScale'),
+    percentScaleVal: gf('s-percentScale'),      // raw value (e.g. 200), matches Kotlin formula
+    // Activity
+    activityState: gs('s-activityState'),
+    activityPct:   gf('s-activityPct'),
+    inactivityPct: gf('s-inactivityPct'),
+    // Night Mode / COB
+    nightMode:     gb('t-nightMode'),
+    nightActive:   gb('t-nightActive'),
+    nightOffset:   gf('s-nightOffset'),
+    cob:           gf('s-cob'),
+    lastCarbAge:   gf('s-lastCarbAge'),
+    cr:            gf('s-cr'),
+    recentLowBg:   gf('s-recentLowBg'),
+    cumSmbCap:     gf('s-cumSmbCap'),
+    nightModeCob:  gb('t-nightModeCob'),
+    // Temp Target
+    tempTarget:    gb('t-tempTarget'),
+    tempTargetBg:  gf('s-tempTargetBg'),
+    highTtSens:    gb('t-highTtSens'),
+    lowTtSens:     gb('t-lowTtSens'),
+    // Boost V6 engine
+    v6Aggression:  gf('s-v6Aggression'),
+    v6HypoCaution: gf('s-v6HypoCaution'),
+    v6Sensitivity: gf('s-v6Sensitivity'),
+    confirmedCap:  gf('s-confirmedCap'),
+    committedCap:  gf('s-committedCap'),
+    fastCarbConfirm: gb('t-fastCarbConfirm'),
+    mlMealLikely:  gf('s-mlMealLikely') / 100,
+    mlHypoRisk:    gf('s-mlHypoRisk') / 100,
+    noMl:          gb('t-noMl'),
+    mlNull3:       gb('t-mlNull3'),
+    v6PriorState:  gs('s-v6PriorState'),
+    postExercise:  gb('t-postExercise'),
+  };
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1734,6 +1961,8 @@ function update() {
   sl('scale',''); sl('maxIob',' U'); sl('bolusMax',' U');
   sl('insulinReqPct','%'); sl('smbMin',' min'); sl('uamSmbMin',' min');
   sl('lastCarbAge',' min'); sl('cr',' g/U');
+  sl('recentLowBg',' mg/dL'); sl('cumSmbCap',' U');
+  sl('confirmedCap',' U'); sl('committedCap',' U');
   sl('percentScale','%');
   sl('activityPct','%'); sl('inactivityPct','%');
   sl('nightOffset',' mg/dL'); sl('cob',' g');
@@ -1761,7 +1990,7 @@ function update() {
     'T2_COB_SECONDARY': 'Tier 2 — COB Secondary (<40 min, delta>5)',
     'T3_UAM_BOOST':     'Tier 3 — UAM Boost',
     'T4_UAM_HIGH_BOOST':'Tier 4 — UAM High Boost (BG>180)',
-    'T5_PERCENT_SCALE': 'Tier 5 — Percent Scale (BG 98–181, delta>3)',
+    'T5_PERCENT_SCALE': 'Tier 5 — Percent Scale (BG 110–180, delta>3)',
     'T6_ACCELERATION':  'Tier 6 — Acceleration (delta_accl>25)',
     'T7_ENHANCED_OREF1':'Tier 7 — Enhanced oref1',
     'T8_REGULAR_OREF1': 'Tier 8 — Regular oref1 (fallback)',
@@ -1776,6 +2005,7 @@ function update() {
   };
   pills.push({text: tierLabels[r.tier] || r.tier, cls: tierCls[r.tier] || 'pill-gray'});
   if (r.fastCarbRebound) pills.push({text:`Fast-carb protection: ${Math.round(r.fastCarbScale*100)}% scale`, cls:'pill-red'});
+  if (r.inPostRescueWindow) pills.push({text:`Post-rescue window (low ${fmt(inp.recentLowBg,0)} < 75) — T3/T4/T5 blocked`, cls:'pill-red'});
   pills.push({text:`δ_accl=${fmt(r.delta_accl,1)}% | UAM1=${fmt(r.uamBoost1,2)} | UAM2=${fmt(r.uamBoost2,2)} | eBG=${fmt(r.eventualBG,0)}`, cls:'pill-gray'});
 
   document.getElementById('status-row').innerHTML = pills.map(p =>
@@ -1841,7 +2071,7 @@ function update() {
     'T2_COB_SECONDARY': { label:'Tier 2 — COB Secondary',      why:'COB present, <40 min, delta >5 mg/dL/5m',          color:'#10b981', bg:'rgba(16,185,129,0.08)', border:'#10b981' },
     'T3_UAM_BOOST':     { label:'Tier 3 — UAM Boost',          why:'Strong rise: delta≥5, shortAvg≥3, uam1>1.2, uam2>2',color:'#f59e0b', bg:'rgba(245,158,11,0.08)', border:'#f59e0b' },
     'T4_UAM_HIGH_BOOST':{ label:'Tier 4 — UAM High Boost',     why:'BG >180 with acceleration (δ_accl >5%)',            color:'#f59e0b', bg:'rgba(245,158,11,0.08)', border:'#f59e0b' },
-    'T5_PERCENT_SCALE': { label:'Tier 5 — Percent Scale',      why:'BG 98–181, delta >3, any acceleration (δ_accl >0)',  color:'#a78bfa', bg:'rgba(167,139,250,0.08)', border:'#a78bfa' },
+    'T5_PERCENT_SCALE': { label:'Tier 5 — Percent Scale',      why:'BG 110–180, delta >3, any acceleration (δ_accl >0)',  color:'#a78bfa', bg:'rgba(167,139,250,0.08)', border:'#a78bfa' },
     'T6_ACCELERATION':  { label:'Tier 6 — Acceleration Bolus', why:'Rapid acceleration: δ_accl >25%, delta >4',         color:'#f59e0b', bg:'rgba(245,158,11,0.08)', border:'#f59e0b' },
     'T7_ENHANCED_OREF1':{ label:'Tier 7 — Enhanced oref1',     why:'Mild rise: delta >0, δ_accl ≥0.5%',                color:'#6ee7b7', bg:'rgba(110,231,183,0.06)', border:'#334155' },
     'T8_REGULAR_OREF1': { label:'Tier 8 — Regular oref1',      why:'Fallback: flat/falling BG or no boost conditions met',color:'#64748b', bg:'rgba(100,116,139,0.06)', border:'#334155' },
@@ -1908,7 +2138,7 @@ function update() {
   document.getElementById('out-smb-breakdown').textContent = smbBreak;
 
   // Percent Scaling comparison row
-  // Percent scaling fires in Tier 5 (BG 98-181, delta>3, accelerating).
+  // Percent scaling fires in Tier 5 (BG 110-180, delta>3, accelerating).
   // Tiers 1-7 cap against boost_max (bolusMax here), NOT maxBolus from uamSmbMin.
   // Tier 8 (fallback) is the only tier using maxBolus from uamSmbMin — it does NOT use percent scaling.
   // So the correct comparison uses bolusMax as the only cap.
@@ -1937,7 +2167,7 @@ function update() {
       noteEl.textContent = `Both paths hit the Boost Max Bolus cap (${fmt(inp.bolusMax,2)} U). To see the scaling difference, lower Boost Max Bolus or ensure insulinReq is small enough that the divisor change matters.`;
     } else {
       const pctDiff = ((diff / unscaled) * 100).toFixed(1);
-      noteEl.textContent = `Tier 5 (BG 98–181, delta>3): percent scaling ${diff > 0 ? 'increases' : 'decreases'} microbolus by ${fmt(Math.abs(diff),3)} U (${pctDiff > 0 ? '+' : ''}${pctDiff}%). insulinDivisor=${fmt(r.scaledDivisor,3)} vs base=${fmt(r.baseReqDivisor,3)}.`;
+      noteEl.textContent = `Tier 5 (BG 110–180, delta>3): percent scaling ${diff > 0 ? 'increases' : 'decreases'} microbolus by ${fmt(Math.abs(diff),3)} U (${pctDiff > 0 ? '+' : ''}${pctDiff}%). insulinDivisor=${fmt(r.scaledDivisor,3)} vs base=${fmt(r.baseReqDivisor,3)}.`;
     }
   } else {
     psRow.style.display = 'none';
@@ -1984,69 +2214,107 @@ function update() {
   ];
   document.getElementById('out-smb-sensitivity').innerHTML = lines.join('<br>');
 
-  // ── Boost V6 engine panel ─────────────────────────────────
+  // ── Boost V6 tab ──────────────────────────────────────────
   document.getElementById('v-v6Aggression').textContent  = inp.v6Aggression.toFixed(2);
   document.getElementById('v-v6HypoCaution').textContent  = inp.v6HypoCaution.toFixed(2);
   document.getElementById('v-v6Sensitivity').textContent  = inp.v6Sensitivity.toFixed(2);
   document.getElementById('v-mlMealLikely').textContent   = Math.round(inp.mlMealLikely * 100) + '%';
   document.getElementById('v-mlHypoRisk').textContent     = Math.round(inp.mlHypoRisk * 100) + '%';
-  renderV6Panel(inp, r);
+  renderV6Tab(inp, r);
 
   // Charts
   drawCharts(inp, r);
 }
 
-// Render the V1-tiers vs V6-engine side-by-side comparison (Tab 1).
 const V6_STATE_META = {
-  IDLE:       { label: 'IDLE',       why: 'baseline — oref pass-through (1.0×)',        color: '#64748b' },
-  OBSERVING:  { label: 'OBSERVING',  why: 'test dose while a rise is watched (0.3×)',   color: '#f59e0b' },
-  CONFIRMED:  { label: 'CONFIRMED',  why: 'meal confirmed — catch-up dose (1.8×)',      color: '#10b981' },
-  COMMITTED:  { label: 'COMMITTED',  why: 'sustained dosing at baseline (1.0×, cap 0.25U)', color: '#a78bfa' },
-  RECOVERING: { label: 'RECOVERING', why: 'backing off as IOB bites (0.4×)',            color: '#38bdf8' },
+  IDLE:       { label: 'IDLE',       why: 'baseline — oref pass-through (1.0×, capped at V1 would-dose)', color: '#64748b' },
+  OBSERVING:  { label: 'OBSERVING',  why: 'test dose while a rise is watched (0.3×, capped at V1 would-dose)', color: '#f59e0b' },
+  CONFIRMED:  { label: 'CONFIRMED',  why: 'meal confirmed — catch-up dose (1.8× × Aggression, Confirmed cap)', color: '#10b981' },
+  COMMITTED:  { label: 'COMMITTED',  why: 'sustained dosing at baseline (1.0×, Committed cap per cycle)', color: '#a78bfa' },
+  RECOVERING: { label: 'RECOVERING', why: 'backing off as IOB bites (0.4×, capped at V1 would-dose)', color: '#38bdf8' },
 };
-function renderV6Panel(inp, r) {
+
+// Render the Boost V6 tab: state machine, gates, dose breakdown + V1 reference line.
+function renderV6Tab(inp, r) {
   const prior = v6FreshState();
   prior.state = inp.v6PriorState;
-  // Seed hysteresis so a snapshot from OBSERVING can legitimately transition.
+  // Seed hysteresis so a snapshot from OBSERVING can legitimately transition
+  // (age ≥ CONFIRM_MIN_AGE pre-increment — i.e. "already 3+ cycles in OBSERVING").
   if (inp.v6PriorState === 'OBSERVING') { prior.age = V6.CONFIRM_MIN_AGE; }
   if (inp.v6PriorState === 'CONFIRMED' || inp.v6PriorState === 'COMMITTED') { prior.committed = true; }
+  if (inp.v6PriorState === 'RECOVERING') { prior.committed = true; prior.age = V6.RECOVER_REENGAGE_MIN_AGE; }
   const m = v6Measurement(inp, r);
   const v6 = v6Decide(r.insulinReqV1, m, prior, v6Knobs(inp));
+  const v1WouldDose = r.tier === 'BLOCKED' ? 0 : r.microBolus;
+  const ov = v6Override(v6, v1WouldDose, {
+    asleep: m.asleep, boostInactive: false,
+    cumSmbCap: inp.cumSmbCap, recentSmbVolume60Min: 0,
+    recentLowBg: inp.recentLowBg,
+  });
 
-  document.getElementById('out-cmp-basereq').textContent = fmt(r.insulinReqV1, 3);
-
-  // V1 column
-  const tierShort = { 'T1_COB_PRIMARY':'Tier 1 · COB primary','T2_COB_SECONDARY':'Tier 2 · COB secondary',
-    'T3_UAM_BOOST':'Tier 3 · UAM boost','T4_UAM_HIGH_BOOST':'Tier 4 · UAM high boost',
-    'T5_PERCENT_SCALE':'Tier 5 · percent scale','T6_ACCELERATION':'Tier 6 · acceleration',
-    'T7_ENHANCED_OREF1':'Tier 7 · enhanced oref1','T8_REGULAR_OREF1':'Tier 8 · regular oref1','BLOCKED':'SMBs blocked' };
-  const v1Dose = r.tier === 'BLOCKED' ? 0 : r.microBolus;
-  document.getElementById('out-cmp-v1-tier').textContent = tierShort[r.tier] || r.tier;
-  document.getElementById('out-cmp-v1-dose').textContent = fmt(v1Dose, 2);
-
-  // V6 column
+  // Status pills
+  const pills = [];
   const sm = V6_STATE_META[v6.state] || { label: v6.state, why: '', color: '#94a3b8' };
-  const arrow = v6.prevState !== v6.state ? ` (from ${v6.prevState})` : '';
-  const v6StateEl = document.getElementById('out-cmp-v6-state');
-  v6StateEl.innerHTML = `<b style="color:${sm.color}">${sm.label}</b>${arrow}<br><span style="color:#64748b">${v6.hard ? '⚠ ' + v6.hard : sm.why}</span>`;
-  const v6DoseEl = document.getElementById('out-cmp-v6-dose');
-  v6DoseEl.textContent = fmt(v6.finalDose, 2);
-  v6DoseEl.style.color = sm.color;
+  pills.push({ text: `State: ${v6.state}${v6.prevState !== v6.state ? ' ← ' + v6.prevState : ''}`, cls: 'pill-green' });
+  pills.push({ text: `score ${fmt(v6.score, 3)}`, cls: v6.score >= V6.ENTER_OBSERVING ? 'pill-yellow' : 'pill-gray' });
+  pills.push({ text: `budget ${fmt(v6.budget, 3)} U`, cls: 'pill-gray' });
+  if (m.asleep) pills.push({ text: 'Sleep engaged — V6 override suppressed, V1 base SMB delivered', cls: 'pill-yellow' });
+  if (v6.hard) pills.push({ text: `HARD GATE: ${v6.hard}`, cls: 'pill-red' });
+  if (v6.gates.length) pills.push({ text: v6.gates.join(' · '), cls: 'pill-yellow' });
+  if (ov.nonMealCapped) pills.push({ text: `non-meal-capped from ${fmt(v6.finalDose, 2)} U`, cls: 'pill-yellow' });
+  if (ov.postRescueCapped) pills.push({ text: ov.note, cls: 'pill-red' });
+  if (ov.mode === 'cum-cap') pills.push({ text: 'cumulative 60-min SMB cap reached', cls: 'pill-red' });
+  if (v6.renorm) pills.push({ text: 'ML null ≥3 cycles — weights renormalized ×1.25', cls: 'pill-gray' });
+  else if (m.mlMealLikely == null) pills.push({ text: 'ML null (<3 cycles) — ML term contributes 0', cls: 'pill-gray' });
+  document.getElementById('v6-status-row').innerHTML = pills.map(p =>
+    `<span class="pill ${p.cls}">${p.text}</span>`).join('');
 
-  // Delta line
-  const d = v6.finalDose - v1Dose;
-  const dEl = document.getElementById('out-cmp-delta');
-  if (Math.abs(d) < 0.025) { dEl.style.color = '#64748b'; dEl.textContent = `V6 and V1 dose within 0.05 U here (${fmt(v6.finalDose,2)} U)`; }
-  else if (d > 0) { dEl.style.color = '#6ee7b7'; dEl.textContent = `V6 doses +${fmt(d,2)} U more than V1 here (${v6.state})`; }
-  else { dEl.style.color = '#fbbf24'; dEl.textContent = `V6 doses ${fmt(d,2)} U vs V1 here — ${v6.state==='OBSERVING'?'holding back to confirm the meal':v6.state}`; }
+  // State banner
+  const banner = document.getElementById('out-v6-state-banner');
+  banner.style.borderColor = sm.color;
+  document.getElementById('out-v6-state-name').style.color = sm.color;
+  document.getElementById('out-v6-state-name').textContent =
+    `${sm.label}${v6.prevState !== v6.state ? ' (from ' + v6.prevState + ')' : ''}`;
+  document.getElementById('out-v6-state-why').textContent = sm.why;
+  document.getElementById('out-v6-score').textContent = fmt(v6.score, 3);
+  document.getElementById('out-v6-score').style.color = sm.color;
+
+  // State detail: score components + transition context
+  const t = v6.scoreTerms;
+  let sd = `score terms: delta ${fmt(t.deltaTerm,2)}×0.30 | accl ${fmt(t.deltaAcclTerm,2)}×0.16 | ML ${m.mlMealLikely==null?'null':fmt(m.mlMealLikely,2)}×0.20 | notLow ${fmt(t.notLowTerm,2)}×0.12 | timeOfDay ${fmt(t.todTerm,2)}×0.10 | notEx ${fmt(t.notExTerm,2)}×0.04 | sustained ${fmt(t.sustainedTerm,2)}×0.15${v6.renorm ? '  [ML dropped → ×1.25 renorm]' : ''}\n`;
+  sd += `notRecentlyLow is continuous: max(0.4, (recentLow ${fmt(inp.recentLowBg,0)} − 70)/30) = ${fmt(t.notLowTerm,2)}\n`;
+  sd += `cumRise30 = shortAvgDelta ×6 = ${fmt(m.cumRise30,0)} mg/dL | eventualBG offset ${fmt(m.eventualBgOffset,0)} (confirm needs peak ≥30)\n`;
+  sd += `prior state ${inp.v6PriorState} (age ${prior.age}) → ${v6.state}. Age gates check PRE-increment age: confirm is first possible on the 4th OBSERVING cycle.\n`;
+  const fcAllowed = inp.fastCarbConfirm && inp.recentLowBg >= V6.FC_MIN_RECENT_LOW;
+  sd += `fast-carb fast-path: ${inp.fastCarbConfirm ? (fcAllowed ? 'armed' : `BLOCKED — recent low ${fmt(inp.recentLowBg,0)} < ${V6.FC_MIN_RECENT_LOW} (post-hypo rescue guard)`) : 'disabled (pref)'}${fcAllowed ? ` (needs delta ≥${V6.FC_DELTA}, accl ≥${V6.FC_ACCL}, score ≥${V6.FC_SCORE}, awake, not exercising${prior.committed ? ', blocked: already committed this session' : ''})` : ''}`;
+  document.getElementById('out-v6-state-detail').textContent = sd;
+
+  // Confirm-adequacy gate verdict
+  const cg = document.getElementById('out-v6-confirm-gate');
+  const shotTxt = `prospective commit-shot = budget ${fmt(v6.budget,3)} × 1.8 × aggression ${fmt(inp.v6Aggression,2)} × velocity ${fmt(v6.velFactor,2)} = ${fmt(v6.prospectiveShot,3)} U; floor = min(committedCap ${fmt(inp.committedCap,2)}, 0.8×confirmedCap ${fmt(0.8*inp.confirmedCap,2)}) = ${fmt(v6.confirmFloor,2)} U`;
+  if (v6.confirmDoseAdequate) {
+    cg.style.borderColor = '#059669'; cg.style.color = '#6ee7b7';
+    cg.textContent = `Confirm-adequacy gate OK: shot ${fmt(v6.prospectiveShot,2)}U > floor ${fmt(v6.confirmFloor,2)}U — ${shotTxt}`;
+  } else {
+    cg.style.borderColor = '#b91c1c'; cg.style.color = '#f87171';
+    cg.textContent = `Confirm BLOCKED by dose-adequacy gate: shot ${fmt(v6.prospectiveShot,2)}U ≤ floor ${fmt(v6.confirmFloor,2)}U (a commit-shot smaller than one COMMITTED hold isn't worth the per-session token). ${shotTxt}. Fast-carb fast-path is exempt.`;
+  }
+
+  // Dose + V1 reference
+  document.getElementById('out-v6-dose').textContent = fmt(ov.dose, 2);
+  document.getElementById('out-v6-v1ref').innerHTML =
+    `V1 would deliver: <b>${fmt(v1WouldDose, 2)} U</b> <span style="color:#64748b">(reference only — the shipped V6 engine consumes this: non-meal states are capped at it, and sleep/Boost-inactive cycles fall back to it)</span>`;
 
   // Breakdown
-  let bd = `score = ${fmt(v6.score,3)}  (enter OBS ≥${V6.ENTER_OBSERVING}, confirm peak ≥${V6.CONFIRM_SCORE})${inp.noMl?'  [ML null → renormalized ×1.25]':''}\n`;
-  bd += `budget = max(${V6.BUDGET_FLOOR}×base, base ${fmt(r.insulinReqV1,3)} × mlHypo ${fmt(v6.mlScale,2)} × postEx ${fmt(v6.postEx,2)} × sens ${fmt(v6.sens,2)}) = ${fmt(v6.budget,3)} U\n`;
-  bd += `dose = budget ${fmt(v6.budget,3)} × multiplier(${v6.state}) ${fmt(v6.actionMult,2)} = ${fmt(v6.rawDose,3)} U\n`;
-  bd += `× velocity ${fmt(v6.velFactor,2)} (cumRise30 ${fmt(m.cumRise30,0)}) = ${fmt(v6.velScaled,3)} U → state-cap ${fmt(v6.capped,3)} U\n`;
-  if (v6.hard) bd += `HARD GATE: ${v6.hard} → 0 U`;
-  else bd += `gates: ${v6.gates.length ? v6.gates.join(', ') : 'none'} → final ${fmt(v6.finalDose,2)} U${v6.spikeCapped ? ' (spike-capped)' : ''}`;
+  let bd = `base insulinReq (from V1 ISF stack) = ${fmt(r.insulinReqV1,3)} U\n`;
+  bd += `budget = max(${V6.BUDGET_FLOOR}×base, base × mlHypo ${fmt(v6.mlScale,2)} × postEx ${fmt(v6.postEx,2)} × sens ${fmt(v6.sens,2)}) = ${fmt(v6.budget,3)} U\n`;
+  bd += `dose = budget × multiplier(${v6.state}) ${fmt(v6.actionMult,2)} = ${fmt(v6.rawDose,3)} U\n`;
+  bd += `× velocity ${fmt(v6.velFactor,2)} (cumRise30 ${fmt(m.cumRise30,0)}) = ${fmt(v6.velScaled,3)} U → state-cap ${fmt(v6.capped,3)} U${v6.stateCapped ? ` (${v6.state} cap ${fmt(v6.state==='CONFIRMED'?inp.confirmedCap:inp.committedCap,2)}U bound)` : ''}\n`;
+  if (v6.hard) bd += `HARD GATE: ${v6.hard} → 0 U\n`;
+  else bd += `gates: ${v6.gates.length ? v6.gates.join(', ') : 'none'} → engine dose ${fmt(v6.finalDose,2)} U${v6.spikeCapped ? ' (spike-capped)' : ''}\n`;
+  if (ov.mode === 'sleep' || ov.mode === 'boost-inactive' || ov.mode === 'cum-cap') bd += `override site: ${ov.note}`;
+  else if (ov.nonMealCapped) bd += `override site: ${ov.note}`;
+  else bd += `override site: V6 drives the SMB (state ${v6.state}${ov.inMealState ? ', meal state — no non-meal cap' : `, non-meal cap min(V6, V1=${fmt(v1WouldDose,2)}U) not binding`})`;
   document.getElementById('out-v6-breakdown').textContent = bd;
 }
 
@@ -2057,7 +2325,10 @@ function drawCharts(inp, r) {
   drawIsfChart(inp, r);
   drawRatioChart(inp, r);
   drawSmbChart(inp, r);
-  drawProjectionChart(inp, r);
+  const proj = computeProjection(inp, r);
+  drawProjChart('projChartV1', inp, proj, 'v1');
+  drawProjChart('projChartV6', inp, proj, 'v6');
+  renderProjLogs(inp, r, proj);
 }
 
 function setupCanvas(id) {
@@ -2299,16 +2570,16 @@ function drawSmbChart(inp, r) {
       smb = Math.floor(Math.min(insulinReq/baseReqDivisor_chart, insulinReq) * RC) / RC;
     } else if (inp.cob > 0 && inp.lastCarbAge < 40 && inp.delta > 5) {
       smb = Math.floor(Math.min(insulinReq/baseReqDivisor_chart, inp.bolusMax) * RC) / RC;
-    } else if (inp.delta >= 5 && inp.shortAvgDelta >= 3 && r.uamBoost1 > 1.2 && r.uamBoost2 > 2 && inp.iob < inp.maxIob && eventBG > inp.target && bg > 80) {
+    } else if (!r.inPostRescueWindow && inp.delta >= 5 && inp.shortAvgDelta >= 3 && r.uamBoost1 > 1.2 && r.uamBoost2 > 2 && inp.iob < inp.maxIob && eventBG > inp.target && bg > 80) {
       const t3d = r.delta_accl > 1 ? scaledDiv : baseReqDivisor_chart;
       smb = Math.floor(Math.min(insulinReq/t3d, inp.bolusMax) * RC) / RC;
       if (r.fastCarbRebound) smb = Math.floor(smb * r.fastCarbScale * RC) / RC;
-    } else if (r.delta_accl > 5 && bg > 180 && inp.iob < inp.maxIob && eventBG > inp.target && bg > 80) {
+    } else if (!r.inPostRescueWindow && (r.delta_accl > 5 || inp.delta > 8) && bg > 180 && inp.iob < inp.maxIob && eventBG > inp.target && bg > 80) {
       smb = Math.floor(Math.min(Math.min(boost_scale_chart*effectiveBasal_chart,inp.bolusMax), inp.bolusMax) * RC) / RC;
-    } else if (bg > 110 && bg < 181 && inp.delta > 3 && r.delta_accl > 0 && eventBG > inp.target && inp.iob < inp.maxIob) {
+    } else if (!r.inPostRescueWindow && bg > 110 && bg < 181 && inp.delta > 3 && r.delta_accl > 0 && eventBG > inp.target && inp.iob < inp.maxIob) {
       smb = Math.floor(Math.min(insulinReq/scaledDiv, inp.bolusMax) * RC) / RC;
       if (r.fastCarbRebound) smb = Math.floor(smb * r.fastCarbScale * RC) / RC;
-    } else if (r.delta_accl > 25 && inp.delta > 4 && inp.iob < inp.maxIob && eventBG > inp.target) {
+    } else if (r.delta_accl > 25 && inp.delta > 4 && bg > 110 && inp.iob < inp.maxIob && eventBG > inp.target) {
       const d6 = baseReqDivisor_chart - ((Math.abs(bg-180)/72)*(baseReqDivisor_chart - 2*scale_pct_c));
       const bi = Math.min(boost_scale_chart*effectiveBasal_chart, inp.bolusMax);
       smb = Math.floor(Math.min(bi/d6, inp.bolusMax) * RC) / RC;
@@ -2391,10 +2662,11 @@ const DEFAULTS = {
   percentScale:false, percentScaleVal:200,
   activityState:'normal', activityPct:80, inactivityPct:130,
   nightMode:false, nightActive:false, nightOffset:27,
-  cob:0, lastCarbAge:60, cr:10, recentLow:false, nightModeCob:false,
+  cob:0, lastCarbAge:60, cr:10, recentLowBg:120, cumSmbCap:10, nightModeCob:false,
   tempTarget:false, tempTargetBg:140, highTtSens:false, lowTtSens:false,
   v6Aggression:1.0, v6HypoCaution:1.0, v6Sensitivity:1.0,
-  mlMealLikely:0, mlHypoRisk:0, noMl:false, v6PriorState:'IDLE', postExercise:false,
+  confirmedCap:2.5, committedCap:0.5, fastCarbConfirm:true,
+  mlMealLikely:0, mlHypoRisk:0, noMl:false, mlNull3:false, v6PriorState:'IDLE', postExercise:false,
 };
 const scenarios = {
   default:      { ...DEFAULTS },
@@ -2443,27 +2715,23 @@ function toggleSection(header) {
 }
 
 // ════════════════════════════════════════════════════════════
-// BG Projection Chart
+// BG Projection — one shared cycle-by-cycle simulation, drawn per tab.
+// Illustrative trend arithmetic, NOT a body simulation.
 // ════════════════════════════════════════════════════════════
-function drawProjectionChart(inp, r) {
-  const c = setupCanvas('projChart');
-  if (!c) return;
-  const { ctx, W, H } = c;
-  const pad = { t: 24, r: 28, b: 44, l: 52 };
-
+function computeProjection(inp, r) {
   // ── Build historical BG series ────────────────────────────
   // Use real NS data if available; otherwise synthesise from current BG + deltas
-  let hist;
+  let hist, source;
   if (nsHistory.length >= 2) {
     hist = [...nsHistory].sort((a, b) => a.t - b.t); // oldest first, t ≤ 0
-    document.getElementById('proj-data-source').textContent = 'Using Nightscout data';
+    source = 'Using Nightscout data';
   } else {
     // Synthetic: back-project using longAvgDelta for each 5-min step
     hist = [];
     for (let i = 5; i >= 0; i--) {
       hist.push({ t: -(i * 5), bg: inp.bg - inp.longAvgDelta * i });
     }
-    document.getElementById('proj-data-source').textContent = 'Manual simulation (connect Nightscout for real history)';
+    source = 'Manual simulation (connect Nightscout for real history)';
   }
 
   // ── Insulin activity model ────────────────────────────────
@@ -2509,17 +2777,24 @@ function drawProjectionChart(inp, r) {
   const withBoostBGs = [inp.bg];
   const withV6BGs = [inp.bg];
   const smbEvents = []; // {t, units, bg} — V1 tiers
-  const v6Events = [];  // {t, units, bg, state} — V6 engine
+  const v6Events = [];  // {t, units, bg, state, mode, nonMealCapped} — V6 via the override site
+  let v1CapHit = false, v6CapHit = false;
 
-  // Seed with current IOB as a "bolus delivered DIA/2 minutes ago" proxy
+  // Seed with current IOB as a "bolus delivered peak minutes ago" proxy
   // so it decays correctly going forward
   const pendingNone  = inp.iob > 0 ? [{ deliveredAt: -peak, units: inp.iob }] : [];
   const pendingBoost = inp.iob > 0 ? [{ deliveredAt: -peak, units: inp.iob }] : [];
   const pendingV6    = inp.iob > 0 ? [{ deliveredAt: -peak, units: inp.iob }] : [];
   // V6 chains its meal state-machine cycle-by-cycle (this is what a snapshot can't show).
   let v6st = v6FreshState(); v6st.state = inp.v6PriorState;
+  if (inp.v6PriorState === 'OBSERVING') v6st.age = V6.CONFIRM_MIN_AGE;
+  if (inp.v6PriorState === 'CONFIRMED' || inp.v6PriorState === 'COMMITTED' || inp.v6PriorState === 'RECOVERING') v6st.committed = true;
   const v6Knb = v6Knobs(inp);
   let prevTrendRate = inp.longAvgDelta;  // mg/dL per 5-min, for deltaAccl
+  const chainDeltas = [inp.longAvgDelta, inp.shortAvgDelta, inp.delta]; // for deltaDeclining
+  const asleep = inp.nightMode && inp.nightActive;
+  // Rolling 60-min delivered-SMB volume — the cumulative cap both engines enforce (0 = disabled)
+  const vol60 = (events, t) => events.filter(e => e.t > t - 60 && e.units > 0).reduce((s, e) => s + e.units, 0);
 
   for (let i = 1; i < STEPS; i++) {
     const t = i * STEP;  // minutes from now
@@ -2533,13 +2808,15 @@ function drawProjectionChart(inp, r) {
     const bgNone = Math.max(40, noBoostBGs[i-1] + trend - iobEffNone);
     noBoostBGs.push(bgNone);
 
-    // ── With-boost projection ──
+    // ── V1 tiers projection ──
     const iobEffBoost = bgEffect(t - STEP, t) * iobRemaining(pendingBoost, t - STEP);
     let bgWith = Math.max(40, withBoostBGs[i-1] + trend - iobEffBoost);
 
-    // Would Boost fire? Use current tier/microbolus logic scaled by insulinReq ratio
+    // Would Boost fire? Use current tier/microbolus logic scaled by insulinReq ratio.
     const iobNow = iobRemaining(pendingBoost, t);
-    if (!r.ioBlock && !r.boostDisabledScale && !r.nightSuppressed &&
+    const v1CapReached = inp.cumSmbCap > 0 && vol60(smbEvents, t) >= inp.cumSmbCap;
+    if (v1CapReached) v1CapHit = true;
+    if (!r.ioBlock && !r.boostDisabledScale && !r.nightSuppressed && !v1CapReached &&
         bgWith > inp.target && iobNow < inp.maxIob && r.microBolus > 0) {
       const scaledReq = Math.max(0, (bgWith - inp.target) / r.isfV1);
       const scaleFactor = r.insulinReqV1 > 0 ? Math.min(1, scaledReq / r.insulinReqV1) : 0;
@@ -2551,7 +2828,7 @@ function drawProjectionChart(inp, r) {
     }
     withBoostBGs.push(bgWith);
 
-    // ── V6 engine projection (parallel state-machine) ──
+    // ── V6 engine projection (parallel state-machine + override site) ──
     const iobEffV6 = bgEffect(t - STEP, t) * iobRemaining(pendingV6, t - STEP);
     let bgV6 = Math.max(40, withV6BGs[i-1] + trend - iobEffV6);
     const iobV6Now = iobRemaining(pendingV6, t);
@@ -2560,24 +2837,57 @@ function drawProjectionChart(inp, r) {
     const cycleAccl = (cycleDelta - prevTrendRate) / Math.max(Math.abs(prevTrendRate), 2.0) * 100;
     const v6Base = Math.max(0, (bgV6 - inp.target) / r.isfV1);
     const v6CumRise = Math.max(0, bgV6 - withV6BGs[Math.max(0, i - 6)]);
-    const v6EventualOffset = Math.max(0, (bgV6 + trend * 6) - inp.target);
+    chainDeltas.push(cycleDelta);
     const mV6 = v6Measurement(inp, r, {
       bg: bgV6, eventualBG: bgV6 + trend * 6, baseInsulinReq: v6Base, iob: iobV6Now,
       cumRise30: v6CumRise, delta: cycleDelta, shortAvgDelta: prevTrendRate,
-      deltaAccl: cycleAccl, eventualBgOffset: v6EventualOffset,
+      deltaAccl: cycleAccl, eventualBgOffset: (bgV6 + trend * 6) - inp.target,
+      deltaHistory: chainDeltas.slice(-3),
     });
     const v6dec = v6Decide(v6Base, mV6, v6st, v6Knb);
     v6st = v6dec.newStateObj;
-    if (v6dec.finalDose >= 0.05) {
-      pendingV6.push({ deliveredAt: t, units: v6dec.finalDose });
-      v6Events.push({ t, units: v6dec.finalDose, bg: bgV6, state: v6dec.state });
+    // V1's would-dose at this chain's BG (scaled like the V1 chain) — feeds the non-meal cap
+    // and the sleep fallback at the override site (OpenAPSBoostPlugin.kt:1296-1321).
+    let v1WouldHere = 0;
+    if (!r.ioBlock && !r.boostDisabledScale && !r.nightSuppressed &&
+        bgV6 > inp.target && iobV6Now < inp.maxIob && r.microBolus > 0) {
+      const sf = r.insulinReqV1 > 0 ? Math.min(1, v6Base / r.insulinReqV1) : 0;
+      v1WouldHere = Math.floor(r.microBolus * sf * 20) / 20;
+    }
+    const ov = v6Override(v6dec, v1WouldHere, {
+      asleep, boostInactive: false,
+      cumSmbCap: inp.cumSmbCap, recentSmbVolume60Min: vol60(v6Events, t),
+      recentLowBg: inp.recentLowBg,
+    });
+    if (ov.mode === 'cum-cap') v6CapHit = true;
+    if (ov.dose >= 0.05) {
+      pendingV6.push({ deliveredAt: t, units: ov.dose });
+      v6Events.push({ t, units: ov.dose, bg: bgV6, state: v6dec.state, mode: ov.mode, nonMealCapped: ov.nonMealCapped });
     }
     prevTrendRate = cycleDelta;
     withV6BGs.push(bgV6);
   }
 
+  return { hist, source, noBoostBGs, v1BGs: withBoostBGs, v6BGs: withV6BGs,
+           v1Events: smbEvents, v6Events, v1CapHit, v6CapHit, STEP };
+}
+
+// Draw one engine's projection chart. mode = 'v1' (green line) or 'v6' (amber line).
+function drawProjChart(canvasId, inp, proj, mode) {
+  const c = setupCanvas(canvasId);
+  if (!c) return;
+  const { ctx, W, H } = c;
+  const pad = { t: 24, r: 28, b: 44, l: 52 };
+  const { hist, noBoostBGs, STEP } = proj;
+  const series = mode === 'v1' ? proj.v1BGs : proj.v6BGs;
+  const events = mode === 'v1' ? proj.v1Events : proj.v6Events;
+  const lineColor = mode === 'v1' ? '#10b981' : '#fbbf24';
+
+  const srcEl = document.getElementById('proj-data-source-' + mode);
+  if (srcEl) srcEl.textContent = proj.source;
+
   // ── Axis ranges ────────────────────────────────────────────
-  const allBGs = [...hist.map(h => h.bg), ...noBoostBGs, ...withBoostBGs, ...withV6BGs];
+  const allBGs = [...hist.map(h => h.bg), ...noBoostBGs, ...series];
   const yMin = Math.min(...allBGs, inp.target - 20, 65) - 10;
   const yMax = Math.max(...allBGs, inp.target + 30) + 15;
   const xMin = hist.length ? hist[0].t : -25;
@@ -2590,12 +2900,10 @@ function drawProjectionChart(inp, r) {
   ctx.fillStyle = '#0f1117'; ctx.fillRect(0, 0, W, H);
 
   // ── Background zones ──────────────────────────────────────
-  // Hypo zone (< 70)
   if (yMin < 70) {
     ctx.fillStyle = 'rgba(239,68,68,0.07)';
     ctx.fillRect(pad.l, yS(70), W - pad.l - pad.r, yS(yMin) - yS(70));
   }
-  // Target zone (target ± 20)
   ctx.fillStyle = 'rgba(16,185,129,0.05)';
   ctx.fillRect(pad.l, yS(inp.target + 20), W - pad.l - pad.r, yS(inp.target - 20) - yS(inp.target + 20));
 
@@ -2604,17 +2912,14 @@ function drawProjectionChart(inp, r) {
   for (let bg = Math.ceil(yMin / 20) * 20; bg <= yMax; bg += 20) {
     ctx.beginPath(); ctx.moveTo(pad.l, yS(bg)); ctx.lineTo(W - pad.r, yS(bg)); ctx.stroke();
   }
-  // Vertical time grid
   for (let t = -20; t <= 60; t += 10) {
     ctx.beginPath(); ctx.moveTo(xS(t), pad.t); ctx.lineTo(xS(t), H - pad.b); ctx.stroke();
   }
 
   // ── Reference lines ───────────────────────────────────────
   ctx.setLineDash([5, 4]);
-  // Target line
   ctx.strokeStyle = 'rgba(16,185,129,0.5)'; ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.moveTo(pad.l, yS(inp.target)); ctx.lineTo(W - pad.r, yS(inp.target)); ctx.stroke();
-  // Hypo line
   ctx.strokeStyle = 'rgba(239,68,68,0.4)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(pad.l, yS(70)); ctx.lineTo(W - pad.r, yS(70)); ctx.stroke();
   ctx.setLineDash([]);
@@ -2630,7 +2935,6 @@ function drawProjectionChart(inp, r) {
   ctx.beginPath();
   hist.forEach((p, i) => i === 0 ? ctx.moveTo(xS(p.t), yS(p.bg)) : ctx.lineTo(xS(p.t), yS(p.bg)));
   ctx.stroke();
-  // Dots on historical readings
   hist.forEach(p => {
     ctx.beginPath();
     ctx.arc(xS(p.t), yS(p.bg), 4, 0, Math.PI * 2);
@@ -2647,19 +2951,19 @@ function drawProjectionChart(inp, r) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // ── With-boost projection (green solid) ───────────────────
-  ctx.strokeStyle = '#10b981'; ctx.lineWidth = 2.5;
+  // ── Engine projection (solid) ─────────────────────────────
+  ctx.strokeStyle = lineColor; ctx.lineWidth = 2.5;
   ctx.beginPath();
-  withBoostBGs.forEach((bg, i) => {
+  series.forEach((bg, i) => {
     const t = i * STEP;
     i === 0 ? ctx.moveTo(xS(t), yS(bg)) : ctx.lineTo(xS(t), yS(bg));
   });
   ctx.stroke();
 
-  // Shaded area between the two projections
-  ctx.fillStyle = 'rgba(16,185,129,0.07)';
+  // Shaded area between the engine projection and no-boost
+  ctx.fillStyle = mode === 'v1' ? 'rgba(16,185,129,0.07)' : 'rgba(251,191,36,0.07)';
   ctx.beginPath();
-  withBoostBGs.forEach((bg, i) => {
+  series.forEach((bg, i) => {
     const t = i * STEP;
     i === 0 ? ctx.moveTo(xS(t), yS(bg)) : ctx.lineTo(xS(t), yS(bg));
   });
@@ -2668,45 +2972,19 @@ function drawProjectionChart(inp, r) {
   }
   ctx.closePath(); ctx.fill();
 
-  // ── With-V6 projection (amber solid) ──────────────────────
-  ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5;
-  ctx.beginPath();
-  withV6BGs.forEach((bg, i) => {
-    const t = i * STEP;
-    i === 0 ? ctx.moveTo(xS(t), yS(bg)) : ctx.lineTo(xS(t), yS(bg));
-  });
-  ctx.stroke();
-
-  // ── V1 SMB event markers (purple ▲, above the line) ───────
-  smbEvents.forEach(ev => {
-    const x = xS(ev.t), y = yS(ev.bg);
-    // Triangle pointing up
-    ctx.beginPath();
-    ctx.moveTo(x, y - 14);
-    ctx.lineTo(x - 6, y - 4);
-    ctx.lineTo(x + 6, y - 4);
-    ctx.closePath();
-    ctx.fillStyle = '#a78bfa'; ctx.fill();
-    // Vertical tick at bottom
-    ctx.strokeStyle = 'rgba(167,139,250,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([2,3]);
-    ctx.beginPath(); ctx.moveTo(x, H - pad.b); ctx.lineTo(x, y - 5); ctx.stroke();
-    ctx.setLineDash([]);
-    // Label
-    ctx.fillStyle = '#c4b5fd'; ctx.font = '9px system-ui'; ctx.textAlign = 'center';
-    ctx.fillText(ev.units.toFixed(2) + 'U', x, y - 17);
-  });
-
-  // ── V6 SMB event markers (amber ▼, below the line) ────────
-  v6Events.forEach(ev => {
+  // ── SMB event markers (V1: purple ▲ above; V6: amber ▼ below) ──
+  events.forEach(ev => {
     const x = xS(ev.t), y = yS(ev.bg);
     ctx.beginPath();
-    ctx.moveTo(x, y + 14);
-    ctx.lineTo(x - 6, y + 4);
-    ctx.lineTo(x + 6, y + 4);
+    if (mode === 'v1') {
+      ctx.moveTo(x, y - 14); ctx.lineTo(x - 6, y - 4); ctx.lineTo(x + 6, y - 4);
+    } else {
+      ctx.moveTo(x, y + 14); ctx.lineTo(x - 6, y + 4); ctx.lineTo(x + 6, y + 4);
+    }
     ctx.closePath();
-    ctx.fillStyle = '#fbbf24'; ctx.fill();
-    ctx.fillStyle = '#fcd34d'; ctx.font = '9px system-ui'; ctx.textAlign = 'center';
-    ctx.fillText(ev.units.toFixed(2) + 'U', x, y + 24);
+    ctx.fillStyle = mode === 'v1' ? '#a78bfa' : '#fbbf24'; ctx.fill();
+    ctx.fillStyle = mode === 'v1' ? '#c4b5fd' : '#fcd34d'; ctx.font = '9px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(ev.units.toFixed(2) + 'U', x, mode === 'v1' ? y - 17 : y + 24);
   });
 
   // ── Axis labels ────────────────────────────────────────────
@@ -2719,7 +2997,6 @@ function drawProjectionChart(inp, r) {
   for (let bg = Math.ceil(yMin / 20) * 20; bg <= yMax; bg += 20) {
     if (bg >= yMin && bg <= yMax) ctx.fillText(bg, pad.l - 6, yS(bg) + 4);
   }
-  // BG unit label
   ctx.save(); ctx.translate(13, H / 2); ctx.rotate(-Math.PI / 2);
   ctx.textAlign = 'center'; ctx.fillText('mg/dL', 0, 0); ctx.restore();
 
@@ -2731,37 +3008,50 @@ function drawProjectionChart(inp, r) {
   // Target label
   ctx.fillStyle = 'rgba(16,185,129,0.7)'; ctx.font = '10px system-ui'; ctx.textAlign = 'left';
   ctx.fillText(`Target ${inp.target}`, pad.l + 4, yS(inp.target) - 4);
+}
 
-  // ── Populate SMB log (both engines) ───────────────────────
-  const logEl = document.getElementById('proj-smb-log');
-  const v1Total = smbEvents.reduce((s, e) => s + e.units, 0);
-  const v6Total = v6Events.reduce((s, e) => s + e.units, 0);
-  const v1Final = withBoostBGs[withBoostBGs.length - 1];
-  const v6Final = withV6BGs[withV6BGs.length - 1];
+// ── Per-tab projected-SMB logs ─────────────────────────────
+function renderProjLogs(inp, r, proj) {
   const bgCol = bg => bg < 70 ? '#f87171' : bg < inp.target + 30 ? '#6ee7b7' : '#f59e0b';
-  if (smbEvents.length === 0 && v6Events.length === 0) {
-    logEl.innerHTML = 'No SMBs projected by either engine over the next 60 min given current trend and IOB.';
-  } else {
-    const v1Lines = smbEvents.length
-      ? smbEvents.map(ev => `&nbsp;&nbsp;+${ev.t}m: <b style="color:#a78bfa">${ev.units.toFixed(2)} U</b> (BG ≈ ${Math.round(ev.bg)}, ${r.tier})`).join('<br>')
+  const capTxt = inp.cumSmbCap > 0 ? `rolling 60-min cap ${inp.cumSmbCap.toFixed(1)} U` : '60-min cap disabled (0)';
+
+  const v1El = document.getElementById('proj-smb-log-v1');
+  if (v1El) {
+    const total = proj.v1Events.reduce((s, e) => s + e.units, 0);
+    const fin = proj.v1BGs[proj.v1BGs.length - 1];
+    const lines = proj.v1Events.length
+      ? proj.v1Events.map(ev => `&nbsp;&nbsp;+${ev.t}m: <b style="color:#a78bfa">${ev.units.toFixed(2)} U</b> (BG ≈ ${Math.round(ev.bg)}, ${r.tier})`).join('<br>')
       : '&nbsp;&nbsp;<span style="color:#64748b">none</span>';
-    const v6Lines = v6Events.length
-      ? v6Events.map(ev => `&nbsp;&nbsp;+${ev.t}m: <b style="color:#fbbf24">${ev.units.toFixed(2)} U</b> (BG ≈ ${Math.round(ev.bg)}, ${ev.state})`).join('<br>')
+    v1El.innerHTML = `<b style="color:#a78bfa">V1 tiers</b> — total ${total.toFixed(2)} U (${capTxt}${proj.v1CapHit ? ' — <span style="color:#f87171">cap suspended some cycles</span>' : ''}), BG@+60 <b style="color:${bgCol(fin)}">${Math.round(fin)}</b><br>${lines}`;
+  }
+
+  const v6El = document.getElementById('proj-smb-log-v6');
+  if (v6El) {
+    const total = proj.v6Events.reduce((s, e) => s + e.units, 0);
+    const fin = proj.v6BGs[proj.v6BGs.length - 1];
+    const lines = proj.v6Events.length
+      ? proj.v6Events.map(ev => {
+          const tags = [ev.state];
+          if (ev.mode === 'sleep') tags.push('V1 base — sleep');
+          if (ev.nonMealCapped) tags.push('non-meal-capped');
+          return `&nbsp;&nbsp;+${ev.t}m: <b style="color:#fbbf24">${ev.units.toFixed(2)} U</b> (BG ≈ ${Math.round(ev.bg)}, ${tags.join(', ')})`;
+        }).join('<br>')
       : '&nbsp;&nbsp;<span style="color:#64748b">none</span>';
-    logEl.innerHTML =
-      `<b style="color:#a78bfa">V1 tiers</b> — total ${v1Total.toFixed(2)} U, BG@+60 <b style="color:${bgCol(v1Final)}">${Math.round(v1Final)}</b><br>${v1Lines}<br>` +
-      `<b style="color:#fbbf24">V6 engine</b> — total ${v6Total.toFixed(2)} U, BG@+60 <b style="color:${bgCol(v6Final)}">${Math.round(v6Final)}</b><br>${v6Lines}`;
+    v6El.innerHTML = `<b style="color:#fbbf24">V6 engine</b> — total ${total.toFixed(2)} U (${capTxt}${proj.v6CapHit ? ' — <span style="color:#f87171">cap suspended some cycles</span>' : ''}), BG@+60 <b style="color:${bgCol(fin)}">${Math.round(fin)}</b><br>${lines}`;
   }
 }
 
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    const tabs = ['isf','curve','smb','proj'];
-    t.classList.toggle('active', tabs[i] === name);
-  });
+  if (name !== 'v1' && name !== 'v6') name = 'v1';
+  try { localStorage.setItem('boost_sim_tab', name); } catch (_) {}
+  document.getElementById('tabbtn-v1').classList.toggle('active', name === 'v1');
+  document.getElementById('tabbtn-v6').classList.toggle('active', name === 'v6');
   document.querySelectorAll('.tab-page').forEach(p => {
     p.classList.toggle('active', p.id === 'tab-' + name);
   });
+  // Sidebar: shared sections always visible; engine-specific sections follow the tab
+  document.querySelectorAll('.section.sec-v1').forEach(s => { s.style.display = name === 'v1' ? '' : 'none'; });
+  document.querySelectorAll('.section.sec-v6').forEach(s => { s.style.display = name === 'v6' ? '' : 'none'; });
   setTimeout(() => { const inp = getInputs(); drawCharts(inp, calcAll(inp)); }, 50);
 }
 
@@ -2985,8 +3275,11 @@ function disconnectNs() {
   }
 })();
 
-// Initial render
+// Initial render — restore the persisted tab, then compute everything once
 window.addEventListener('resize', () => { const inp = getInputs(); drawCharts(inp, calcAll(inp)); });
+let savedTab = 'v1';
+try { savedTab = localStorage.getItem('boost_sim_tab') || 'v1'; } catch (_) {}
+switchTab(savedTab);
 update();
 </script>
 </body>

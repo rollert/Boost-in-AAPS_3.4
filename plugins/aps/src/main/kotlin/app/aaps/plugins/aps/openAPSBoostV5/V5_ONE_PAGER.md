@@ -7,8 +7,8 @@ of the eight-tier if-else ladder the existing Boost uses, V5 has a short
 three-phase pipeline that asks "is this a meal?" once, commits to a
 single decision, and applies safety damping in a defined order. It's a
 parallel plugin alongside the current Boost, so V5 doesn't replace
-anything — when it ships, it'll appear in the plugin selector as
-another choice.
+anything — it appears in the plugin selector as **"Boost V6"**, the
+user-facing name it shipped under.
 
 
 **Why I did it**
@@ -84,23 +84,28 @@ Three new dials, calibrated defaults:
 - **Hypo Caution** (1.0–2.0, default 1.0): strengthens the brake when
   the ML hypo-risk model thinks a low is coming. Raise it for hypo
   unawareness or recent severe lows.
-- **Sensitivity** (reserved): currently inert; may ship if backtesting
-  justifies it.
+- **Sensitivity** (0.8–1.2, default 1.0): fine sensitivity multiplier
+  inside the aggression budget — shipped after backtesting justified it.
 
-That's the entire user-facing surface V5 adds.
+Those are the headline knobs. An Advanced sub-screen adds the dose caps
+(CONFIRMED / COMMITTED / cumulative-60-min), the fast-carb confirm
+toggle and the pre-meal target — all auto-seeded from the user's own
+14-day history on first activation (suggestion-only).
 
 
-**Where we are**
+**Where we are (updated 2026-07)**
 
-V5 is **PRE-ALPHA**. It's hidden from the plugin list and cannot be
-selected as the active APS algorithm. While in development it runs in
-parallel with the current Boost during testing, makes its own decision,
-and writes that decision to the AAPS log and Nightscout deviceStatus
+V5 **shipped as the "Boost V6" plugin** — selectable as the active APS
+algorithm and running in production (active on the developer's own pump
+since ~February 2026). Selecting plain **"Boost"** instead runs V1
+dosing with the V6 decision in shadow: it computes what it *would* do
+each cycle and writes it to the AAPS log and Nightscout deviceStatus
 (`boostV5_score`, `boostV5_state`, `boostV5_age`, `boostV5_budget`,
-`boostV5_actionMult`, `boostV5_finalDose`, `boostV5_gateReduction`).
-V5 does not deliver insulin in this state.
+`boostV5_actionMult`, `boostV5_finalDose`, `boostV5_gateReduction`)
+without touching the pump. Shadow-first remains the supported
+onboarding for anyone but the developer.
 
-A daily comparison script tracks where V5's decisions diverged from
-actual delivery for review. V5 will only become user-selectable after
-the test plan's acceptance gates pass on real shadow-mode data. There
-is no clinical superiority claim of V5 over the current Boost yet.
+The backtesting toolkit (`backtesting/`) tracks where V6's decisions
+diverge from V1's delivery. There is still no clinical superiority
+claim — the evidence is one developer's ~5 months of active use plus a
+small shadow cohort (see the README's Testing & evidence section).

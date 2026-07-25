@@ -4,6 +4,7 @@ import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.keys.StringKey
 import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.plugins.aps.getBoostDosing
 import org.json.JSONObject
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -67,7 +68,7 @@ class BoostIsfShadow @Inject constructor(
         synchronized(lock) {
             if (loaded) return
             try {
-                val raw = preferences.get(StringKey.ApsBoostIsfShadowState)
+                val raw = preferences.getBoostDosing(StringKey.ApsBoostIsfShadowState)   // 2026-07-08: read raw so Simple Mode never wipes the shadow state blob
                 if (raw.isNotBlank()) {
                     val j = JSONObject(raw)
                     emaState = j.optDouble("emaState", 1.0)

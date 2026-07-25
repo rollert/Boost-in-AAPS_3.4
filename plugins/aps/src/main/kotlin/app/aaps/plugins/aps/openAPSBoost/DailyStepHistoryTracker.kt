@@ -90,10 +90,20 @@ object DailyStepHistoryTracker {
     /**
      * Merge newly-read **completed**-day totals (dayIndex < [todayIndex]; today is partial and
      * excluded) and trim to the rolling window. Returns a new History (caller persists on change).
+     *
+     * HOLD-HIGHER (2026-07-03): within a source, a recorded day is only ever revised UP. A later
+     * LOWER value for the same day (a stale/partial post-midnight HC sync, an SC-table prune, a
+     * source recount) must not drag a completed day's total down — 2026-07-02 was recorded at 2227
+     * and crept to 3095 while the watch had counted 6224, and the shadow read it as "0.5× baseline /
+     * inactivity". Undercount is the unsafe direction (false inactivity → would-LOWER ISF → more
+     * insulin), so the day record holds the maximum end-of-day count ever seen.
      */
     fun merge(h: History, totals: List<DailyTotal>, todayIndex: Long): History {
         val m = LinkedHashMap(h.days)
-        for (t in totals) if (t.dayIndex in (todayIndex - WINDOW_DAYS) until todayIndex) m[t.dayIndex] = t
+        for (t in totals) if (t.dayIndex in (todayIndex - WINDOW_DAYS) until todayIndex) {
+            val prev = m[t.dayIndex]
+            if (prev == null || t.steps > prev.steps) m[t.dayIndex] = t
+        }
         val cutoff = todayIndex - WINDOW_DAYS
         m.keys.filter { it < cutoff }.toList().forEach { m.remove(it) }
         return History(m)
@@ -231,7 +241,18 @@ object DailyStepHistoryTracker {
         return ratios[ratios.size / 2]
     }
 
-    data class BridgeResult(val history: History, val calibrated: Boolean, val donorsUsed: List<String>)
+    data class BridgeResult(
+        val history: History,
+        val calibrated: Boolean,
+        val donorsUsed: List<String>,
+        /**
+         * NS breadcrumb: set when yesterday's total was HELD at a higher source's count over a lower
+         * competing source (e.g. "held wear 6224 over phone 3095"). Null when yesterday had one
+         * candidate or the candidates agreed. Makes the daily-history reconcile visible in reason
+         * lines — the 2026-07-03 undercount was invisible because nothing logged the resolution.
+         */
+        val heldNote: String? = null
+    )
 
     /**
      * Build one rolling-window [History] in [activeSource]'s units for [todayIndex]: use the active
@@ -263,5 +284,162 @@ object DailyStepHistoryTracker {
             day++
         }
         return BridgeResult(History(out), calibrated = !anyUncalibrated, donorsUsed = donorsUsed.toList())
+    }
+
+    /**
+     * PHONE-ANCHORED rolling window (2026-06-29) — the correct frame when watches are SWAPPED, not
+     * stacked. The old [bridgedWindow] calibrated the old source directly against the new one, but a
+     * watch swap means the two never share a day (one ceases as the other starts) → zero overlap →
+     * no scale → raw forever. The PHONE runs continuously across every watch era, so it is the one
+     * source that overlaps them all: it is the calibration frame.
+     *
+     * Per day in the window, every source that recorded the day becomes a candidate — a worn source
+     * (wear > garmin > hc:*) expressed in phone units when it can be scaled (≥[MIN_OVERLAP_DAYS] of
+     * phone↔that-source overlap), raw otherwise (flagged uncalibrated); the phone's own day as-is —
+     * and the day records the HIGHEST candidate (worn wins a tie, being the on-body count).
+     *
+     * HOLD-HIGHER (2026-07-03 incident): the old per-day cascade (scaled-worn → phone's own day →
+     * raw-worn) could DISCARD a watch's full-day count in favour of a lower value: on 2026-07-02 the
+     * wear watch counted 6224 by 23:57, but the day was recorded as the pocketed phone's 2227
+     * (creeping to 3095 as HC synced more phone data) because the wear count could not yet be
+     * calibrated and the cascade preferred the phone's own day over raw-worn. The shadow then read
+     * "0.5× baseline / inactivity −6.6% ISF" off an undercount. Undercount is the UNSAFE direction
+     * (false inactivity → would-LOWER ISF → more insulin), while an uncalibrated raw-worn overcount
+     * only errs toward "activity" (would-RAISE ISF, less insulin) — so a completed day holds the
+     * MAX of all sources' end-of-day counts, never a lower later value.
+     *
+     * No watch-to-watch calibration is ever needed, so a future swap can never re-open the gap.
+     */
+    fun phoneAnchoredWindow(multi: MultiSourceHistory, todayIndex: Long): BridgeResult {
+        val phone = multi.sources[StepSourceResolver.PHONE] ?: History()
+        val donors = multi.sources.entries
+            .filter { it.key != StepSourceResolver.PHONE }
+            .sortedBy { StepSourceResolver.tier(it.key) }
+        val cals = HashMap<String, Double?>()                       // phone/donor scale, memoised
+        val out = LinkedHashMap<Long, DailyTotal>()
+        val donorsUsed = LinkedHashSet<String>()
+        var anyUncalibrated = false
+        var heldNote: String? = null
+        var day = todayIndex - WINDOW_DAYS
+        while (day < todayIndex) {
+            // All sources' counts for this day (phone units where a calibration exists, else raw).
+            val cands = ArrayList<Candidate>(3)
+            phone.days[day]?.let { cands.add(Candidate(StepSourceResolver.PHONE, it.steps, calibrated = true)) }
+            for (donor in donors) {
+                val dt = donor.value.days[day] ?: continue
+                val cal = cals.getOrPut(donor.key) { calibration(phone, donor.value) }   // median(phone/donor)
+                if (cal != null) cands.add(Candidate(donor.key, (dt.steps * cal).toInt(), calibrated = true))
+                else cands.add(Candidate(donor.key, dt.steps, calibrated = false))
+            }
+            if (cands.isNotEmpty()) {
+                // Hold-higher: highest count wins; on a tie the worn (lower-tier) source names the day.
+                val winner = cands.maxWith(compareBy({ it.steps }, { -StepSourceResolver.tier(it.source) }))
+                out[day] = DailyTotal(day, winner.steps, winner.source)
+                if (winner.source != StepSourceResolver.PHONE) {
+                    donorsUsed.add(winner.source)
+                    if (!winner.calibrated) anyUncalibrated = true
+                }
+                // Breadcrumb for YESTERDAY (the day shadowFactors keys on): record what was held
+                // over what, so the reconcile is visible in NS reason lines.
+                if (day == todayIndex - 1) {
+                    val runnerUp = cands.filter { it.source != winner.source }.maxByOrNull { it.steps }
+                    if (runnerUp != null && winner.steps > runnerUp.steps)
+                        heldNote = "held ${winner.source} ${winner.steps} over ${runnerUp.source} ${runnerUp.steps}"
+                }
+            }
+            day++
+        }
+        return BridgeResult(History(out), calibrated = !anyUncalibrated, donorsUsed = donorsUsed.toList(), heldNote = heldNote)
+    }
+
+    /** One source's count for one day during window resolution: [steps] is phone-units when
+     *  [calibrated], raw otherwise. */
+    private data class Candidate(val source: String, val steps: Int, val calibrated: Boolean)
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    // Intraday running-max bank (2026-07-07) — day-close must never read live counts.
+    //
+    // The 07-06/07 recurrence of the rollover undercount (despite hold-higher): wear stepsToday
+    // peaked 4142 at 22:58 BST, the WEAR counter reset at DEVICE midnight 23:04 (device TZ ≠
+    // phone-local midnight), and the day closed at 739 (the phone's count) — wear's candidate was
+    // already 0/absent at exactly the moment it mattered. Max-of-candidates only works if the
+    // candidates still HOLD their end-of-day values at close time; a source that resets before the
+    // phone-local day boundary never presents its peak to the close.
+    //
+    // Fix: bank a per-source per-day running MAX of today-counts as cycles pass (native units —
+    // calibration into phone units stays where it always was, in [phoneAnchoredWindow]) and close
+    // the day from the BANK. The caller persists the bank (pref) so an app restart mid-evening
+    // keeps the day's peak. This generalises the plugin's old phone-only in-memory ledger
+    // (phoneDayCached/phoneMaxCached) to every source, persisted.
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /** Per-source running max of today's cumulative count, in each source's NATIVE units. */
+    data class IntradayStepBank(val dayIndex: Long = -1L, val maxBySource: Map<String, Int> = linkedMapOf()) {
+
+        fun serialize(): String {
+            val o = JSONObject()
+            for ((src, v) in maxBySource) o.put(src, v)
+            return JSONObject().put("d", dayIndex).put("max", o).toString()
+        }
+
+        companion object {
+            fun deserialize(raw: String): IntradayStepBank {
+                if (raw.isBlank()) return IntradayStepBank()
+                return try {
+                    val root = JSONObject(raw)
+                    val o = root.optJSONObject("max") ?: JSONObject()
+                    val m = linkedMapOf<String, Int>()
+                    for (src in o.keys()) m[src] = o.getInt(src)
+                    IntradayStepBank(root.optLong("d", -1L), m)
+                } catch (e: Exception) {
+                    IntradayStepBank()
+                }
+            }
+        }
+    }
+
+    data class BankCycleResult(
+        val bank: IntradayStepBank,
+        /**
+         * Non-empty exactly on the rollover cycle: the just-closed day's banked per-source maxima
+         * as completed-day totals (native units), ready for [mergeSource]. Empty when no day
+         * closed, when the closed day held no counts, or when the stored day is outside the
+         * rolling window / in the future (clock jump — discarded, never banked as history).
+         */
+        val closedDayTotals: List<DailyTotal>
+    )
+
+    /**
+     * Record this cycle's today-counts into the bank and, on day rollover, return the closed day's
+     * banked maxima. [countsBySource] maps source id (canonicalised here) → today's cumulative
+     * count in that source's native units; a count only ever raises its banked max, so a source
+     * that resets mid-evening (device-midnight wear) or an app restart with a cold live read can
+     * never drag the day back down. Pure — caller persists the returned bank.
+     */
+    fun bankCycle(bank: IntradayStepBank, todayIndex: Long, countsBySource: Map<String, Int>): BankCycleResult {
+        val closed = if (bank.dayIndex != todayIndex && bank.dayIndex in (todayIndex - WINDOW_DAYS) until todayIndex)
+            bank.maxBySource.filter { it.value > 0 }.map { (src, v) -> DailyTotal(bank.dayIndex, v, src) }
+        else emptyList()
+        val newMax = LinkedHashMap(if (bank.dayIndex == todayIndex) bank.maxBySource else emptyMap())
+        for ((src, v) in countsBySource) {
+            val c = StepSourceResolver.canonical(src)
+            if (v > (newMax[c] ?: 0)) newMax[c] = v
+        }
+        return BankCycleResult(IntradayStepBank(todayIndex, newMax), closed)
+    }
+
+    /**
+     * Express [steps] reported by [activeSource] in PHONE-equivalent units, so today's live count
+     * matches the phone-anchored baseline. Phone/unknown/no-overlap → returned unchanged; a worn
+     * source with enough phone overlap → scaled by median(phone/worn).
+     */
+    fun toPhoneUnits(steps: Int, activeSource: String?, multi: MultiSourceHistory): Int {
+        if (activeSource == null) return steps
+        val src = StepSourceResolver.canonical(activeSource)
+        if (src == StepSourceResolver.PHONE) return steps
+        val phone = multi.sources[StepSourceResolver.PHONE] ?: return steps
+        val srcHist = multi.sources[src] ?: return steps
+        val cal = calibration(phone, srcHist) ?: return steps
+        return (steps * cal).toInt()
     }
 }

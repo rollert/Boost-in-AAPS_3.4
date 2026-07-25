@@ -35,6 +35,7 @@ import app.aaps.plugins.aps.openAPSSMB.GlucoseStatusCalculatorSMB
 import app.aaps.core.interfaces.iob.IobCobCalculator
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.notifications.Notification
 import app.aaps.core.interfaces.plugin.ActivePlugin
 import app.aaps.core.interfaces.plugin.PluginBase
 import app.aaps.core.interfaces.plugin.PluginDescription
@@ -61,6 +62,7 @@ import app.aaps.core.keys.IntentKey
 import app.aaps.core.keys.StringKey
 import app.aaps.core.keys.UnitDoubleKey
 import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.plugins.aps.getBoostDosing
 import app.aaps.core.objects.constraints.ConstraintObject
 import app.aaps.core.objects.extensions.convertedToAbsolute
 import app.aaps.core.objects.extensions.getPassedDurationToTimeInMinutes
@@ -93,6 +95,7 @@ import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import app.aaps.plugins.aps.openAPSBoostV5.MealHypothesis
 
 @Singleton
 open class OpenAPSBoostPlugin @Inject constructor(
@@ -170,6 +173,48 @@ open class OpenAPSBoostPlugin @Inject constructor(
             autosensWhenNoTdd -> orefAutosensRatio
             else              -> isfResultRatio
         }
+
+        /** Outcome of the V6-override dose caps: the dose to deliver plus the reason-line breadcrumb ("" when uncapped). */
+        internal data class V6OverrideCaps(val dose: Double, val capNote: String)
+
+        /**
+         * V6-override dose caps (pure — unit-tested directly):
+         *  - non-meal-state cap (2026-07-02): in IDLE/OBSERVING/RECOVERING V6 never out-doses V1;
+         *  - post-rescue meal-state cap (2026-07-04): inside the post-rescue window
+         *    (recentLowBG45Min < [DetermineBasalBoost.POST_RESCUE_LOW_THRESHOLD_MGDL]) the meal-state
+         *    exemption is suppressed, so CONFIRMED/COMMITTED are ALSO capped at V1's would-dose.
+         *
+         * Incident 2026-07-03 19:47 BST: severe hypo (nadir 40) → unannounced rescue carbs → violent
+         * rebound. V6 CONFIRMED at BG 119 delivered 2.7U while V1's 45-min post-rescue tier guard had
+         * restrained the base engine to 1.05U — the meal-state exemption discarded that restraint. BG
+         * then ran 181 → nadir 81 with zero margin, and the 2.7U tripped the 2.5U cumulative cap,
+         * silencing V6 for the following hour.
+         *
+         * DB backtest (2026-07-04): 20.4% of meal-state cycles are post-rescue; 27% of the insulin this
+         * cap removes sits directly ahead of a second low < 70 (vs 14-19% for every other lever
+         * evaluated). Cost side: 10% genuine post-hypo meals, median 0.15U under-delivery, zero
+         * double-dips. Verdict SHIP.
+         *
+         * WHY inherit V1 (alignment is load-bearing): the 75 mg/dL / 45-min window is deliberately the
+         * SAME constant + source value as V1's post-rescue tier guard (DetermineBasalBoost Fix A v2),
+         * so whenever this cap binds, v1WouldDose is by construction the hypo-restrained dose — the cap
+         * inherits V1's restraint instead of inventing a second, divergent notion of "post-rescue".
+         */
+        internal fun applyV6OverrideCaps(
+            inMealState: Boolean,
+            inPostRescueWindow: Boolean,
+            v5FinalDose: Double,
+            v1WouldDose: Double,
+            recentLowBG45Min: Double
+        ): V6OverrideCaps {
+            val dose = if (inMealState && !inPostRescueWindow) v5FinalDose else minOf(v5FinalDose, v1WouldDose)
+            val capNote = when {
+                dose >= v5FinalDose -> ""
+                inMealState         -> ", post-rescue capped from ${Round.roundTo(v5FinalDose, 0.001)}U to V1's ${Round.roundTo(v1WouldDose, 0.001)}U (45-min low ${Round.roundTo(recentLowBG45Min, 1.0)})"
+                else                -> ", non-meal-capped from ${Round.roundTo(v5FinalDose, 0.001)}U"
+            }
+            return V6OverrideCaps(dose, capNote)
+        }
     }
 
     // last values
@@ -200,51 +245,60 @@ open class OpenAPSBoostPlugin @Inject constructor(
     // ---- Boost-specific preference getters ----
 
     // Dynamic ISF
-    private val dynIsfNormalTarget; get() = profileUtil.convertToMgdlDetect(preferences.get(UnitDoubleKey.ApsBoostDynIsfNormalTarget))
-    private val dynIsfVelocity; get() = preferences.get(DoubleKey.ApsBoostDynIsfVelocity) / 100.0
-    private val dynIsfBgCap; get() = profileUtil.convertToMgdlDetect(preferences.get(UnitDoubleKey.ApsBoostDynIsfBgCap))
+    // NOTE: all these Boost getters use preferences.getBoostDosing(...) (not .get) so Simple Mode
+    // does NOT mask the user's / auto-config's stored dosing settings to factory defaults. The keys
+    // keep defaultedBySM = true (they stay HIDDEN in Simple Mode); only the doser's read is unmasked.
+    // See BoostDosingPreferences.kt + 2026-07_maxiob_consistency_REPORT.md.
+    private val dynIsfNormalTarget; get() = profileUtil.convertToMgdlDetect(preferences.getBoostDosing(UnitDoubleKey.ApsBoostDynIsfNormalTarget, profileUtil))
+    private val dynIsfVelocity; get() = preferences.getBoostDosing(DoubleKey.ApsBoostDynIsfVelocity) / 100.0
+    private val dynIsfBgCap; get() = profileUtil.convertToMgdlDetect(preferences.getBoostDosing(UnitDoubleKey.ApsBoostDynIsfBgCap, profileUtil))
 
     // Boost SMB
-    private val boostBolus; get() = preferences.get(DoubleKey.ApsBoostBolus)
-    private val boostMaxIob; get() = preferences.get(DoubleKey.ApsBoostMaxIob)
-    private val boostInsulinReqPct; get() = preferences.get(DoubleKey.ApsBoostInsulinReqPct)
-    private val boostScale; get() = preferences.get(DoubleKey.ApsBoostScale)
-    private val boostPercentScale; get() = preferences.get(DoubleKey.ApsBoostPercentScale)
-    private val enableBoostPercentScale; get() = preferences.get(BooleanKey.ApsBoostEnablePercentScale)
-    private val enableCircadianIsf; get() = preferences.get(BooleanKey.ApsBoostEnableCircadianIsf)
-    private val allowBoostWithHighTt; get() = preferences.get(BooleanKey.ApsBoostAllowWithHighTt)
+    private val boostBolus; get() = preferences.getBoostDosing(DoubleKey.ApsBoostBolus)
+    private val boostMaxIob; get() = preferences.getBoostDosing(DoubleKey.ApsBoostMaxIob)
+    private val boostInsulinReqPct; get() = preferences.getBoostDosing(DoubleKey.ApsBoostInsulinReqPct)
+    private val boostScale; get() = preferences.getBoostDosing(DoubleKey.ApsBoostScale)
+    private val boostPercentScale; get() = preferences.getBoostDosing(DoubleKey.ApsBoostPercentScale)
+    private val enableBoostPercentScale; get() = preferences.getBoostDosing(BooleanKey.ApsBoostEnablePercentScale)
+    private val enableCircadianIsf; get() = preferences.getBoostDosing(BooleanKey.ApsBoostEnableCircadianIsf)
+    private val allowBoostWithHighTt; get() = preferences.getBoostDosing(BooleanKey.ApsBoostAllowWithHighTt)
     // ApsBoostV5ActiveDosing retired 2026-06-15: V5 is now a selectable plugin (Boost V5), so the
     // engine's V5 override is gated by runEngine(v5Active=…) — set true only when the V5 plugin
     // drives the engine. The key is kept in BooleanKey for back-compat but no longer read here.
 
-    // Boost time window
-    private val boostStartTime; get() = preferences.get(StringKey.ApsBoostStartTime)
-    private val boostEndTime; get() = preferences.get(StringKey.ApsBoostEndTime)
-    private val sleepInHours; get() = preferences.get(DoubleKey.ApsBoostSleepInHours)
+    // Boost time window retired 2026-07-02 — boostActive now derives from the night-mode period
+    // (isInNightSleepPeriod). ApsBoostStartTime/EndTime are no longer read.
+    private val sleepInHours; get() = preferences.getBoostDosing(DoubleKey.ApsBoostSleepInHours)
 
     // Step counting thresholds
-    private val inactivitySteps; get() = preferences.get(IntKey.ApsBoostInactivitySteps)
-    private val inactivityPct; get() = preferences.get(DoubleKey.ApsBoostInactivityPct)
-    private val sleepInSteps; get() = preferences.get(IntKey.ApsBoostSleepInSteps)
-    private val activitySteps5; get() = preferences.get(IntKey.ApsBoostActivitySteps5)
-    private val activitySteps15; get() = preferences.get(IntKey.ApsBoostActivitySteps15)
-    private val activitySteps30; get() = preferences.get(IntKey.ApsBoostActivitySteps30)
-    private val activitySteps60; get() = preferences.get(IntKey.ApsBoostActivitySteps60)
-    private val activityPct; get() = preferences.get(DoubleKey.ApsBoostActivityPct)
+    private val inactivitySteps; get() = preferences.getBoostDosing(IntKey.ApsBoostInactivitySteps)
+    private val inactivityPct; get() = preferences.getBoostDosing(DoubleKey.ApsBoostInactivityPct)
+    private val sleepInSteps; get() = preferences.getBoostDosing(IntKey.ApsBoostSleepInSteps)
+    private val activitySteps5; get() = preferences.getBoostDosing(IntKey.ApsBoostActivitySteps5)
+    private val activitySteps15; get() = preferences.getBoostDosing(IntKey.ApsBoostActivitySteps15)
+    private val activitySteps30; get() = preferences.getBoostDosing(IntKey.ApsBoostActivitySteps30)
+    private val activitySteps60; get() = preferences.getBoostDosing(IntKey.ApsBoostActivitySteps60)
+    private val activityPct; get() = preferences.getBoostDosing(DoubleKey.ApsBoostActivityPct)
 
     // Heart rate integration
-    private val hrIntegrationEnabled; get() = preferences.get(BooleanKey.ApsBoostHrIntegrationEnabled)
-    private val hrMaxBpm; get() = preferences.get(IntKey.ApsBoostHrMaxBpm)
-    private val hrRestingBpm; get() = preferences.get(IntKey.ApsBoostHrRestingBpm)
-    private val hrWindowMinutes; get() = preferences.get(IntKey.ApsBoostHrWindowMinutes)
-    private val hrStressDetection; get() = preferences.get(BooleanKey.ApsBoostHrStressDetection)
+    private val hrIntegrationEnabled; get() = preferences.getBoostDosing(BooleanKey.ApsBoostHrIntegrationEnabled)
+    private val hrMaxBpm; get() = preferences.getBoostDosing(IntKey.ApsBoostHrMaxBpm)
+    private val hrRestingBpm; get() = preferences.getBoostDosing(IntKey.ApsBoostHrRestingBpm)
+    private val hrWindowMinutes; get() = preferences.getBoostDosing(IntKey.ApsBoostHrWindowMinutes)
+    private val hrStressDetection; get() = preferences.getBoostDosing(BooleanKey.ApsBoostHrStressDetection)
 
     // Post-exercise recovery
-    private val postExerciseRecoveryEnabled; get() = preferences.get(BooleanKey.ApsBoostPostExerciseRecoveryEnabled)
-    private val postExerciseRecoveryHours; get() = preferences.get(DoubleKey.ApsBoostPostExerciseRecoveryHours)
-    private val postExerciseRecoveryTarget; get() = profileUtil.convertToMgdlDetect(preferences.get(UnitDoubleKey.ApsBoostPostExerciseRecoveryTarget))
-    private val postExerciseRecoveryScale; get() = preferences.get(DoubleKey.ApsBoostPostExerciseRecoveryScale)
-    private val postExerciseMinDuration; get() = preferences.get(IntKey.ApsBoostPostExerciseMinDuration)
+    private val postExerciseRecoveryEnabled; get() = preferences.getBoostDosing(BooleanKey.ApsBoostPostExerciseRecoveryEnabled)
+    private val postExerciseRecoveryHours; get() = preferences.getBoostDosing(DoubleKey.ApsBoostPostExerciseRecoveryHours)
+    private val postExerciseRecoveryTarget; get() = profileUtil.convertToMgdlDetect(preferences.getBoostDosing(UnitDoubleKey.ApsBoostPostExerciseRecoveryTarget, profileUtil))
+    private val postExerciseRecoveryScale; get() = preferences.getBoostDosing(DoubleKey.ApsBoostPostExerciseRecoveryScale)
+    private val postExerciseMinDuration; get() = preferences.getBoostDosing(IntKey.ApsBoostPostExerciseMinDuration)
+
+    // ---- Feed-health edge detection (F4/F6, 2026-07-07) ----
+    // HR: fresh→dark transitions + one waking-hours notification per dark episode.
+    private val hrFeedDarkTracker = HrFeedDarkTracker()
+    // Steps: boostSteps_feed transitions, reason-line only (no notification).
+    @Volatile private var lastStepsFeed: String? = null
 
     // ---- Post-exercise recovery state ----
     @Volatile private var recoveryWindowEnd: Long = 0L
@@ -350,8 +404,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
         val debug = StringBuilder()
 
         // TDD-based ISF calculation
-        val useTdd = preferences.get(BooleanKey.ApsBoostUseTdd)
-        val adjustSens = preferences.get(BooleanKey.ApsBoostAdjustSensitivity)
+        val useTdd = preferences.getBoostDosing(BooleanKey.ApsBoostUseTdd)
+        val adjustSens = preferences.getBoostDosing(BooleanKey.ApsBoostAdjustSensitivity)
 
         if (useTdd) {
             // Fetch all TDD components — use allowMissingDays=true so partial data still works
@@ -475,7 +529,13 @@ open class OpenAPSBoostPlugin @Inject constructor(
         val maxBg: Double,
         val targetBg: Double,
         val activityState: String = "none",
-        val debugReason: String = ""
+        val debugReason: String = "",
+        // True when the step-based sleep-in (lie-in) gate is suppressing Boost this cycle. Cached by
+        // the caller so isNightModeActiveImpl() applies night-mode SMB rules during a lie-in. (2026-07-02)
+        val sleepInActive: Boolean = false,
+        // Which step feeds are live this cycle (F1, 2026-07-07): "phone+wear" | "phone" | "wear" |
+        // "none" — written to RT.boostSteps_feed every cycle so a dark feed is visible in NS.
+        val stepsFeed: String = "none"
     )
 
     private fun calculateBoostActivity(
@@ -490,24 +550,20 @@ open class OpenAPSBoostPlugin @Inject constructor(
         val midnight = now - MidnightUtils.milliSecFromMidnight(now)
         val sleepInMillis = (3600000.0 * sleepInHours).toLong()
 
-        var boostStart = midnight + parseTimeToMillis(boostStartTime)
-        var boostEnd = midnight + parseTimeToMillis(boostEndTime)
+        // Boost is active whenever the user is NOT in their night/sleep period. The night/sleep period
+        // is the HR/step-aware night-mode state — enabled && (night time window OR sleep detection) —
+        // EXCLUDING night mode's BG gate: a nocturnal high (incl. a sensor spike) must NOT re-enable
+        // Boost, or a full V6 meal-amplified SMB could fire while asleep (the 2026-07-01 incident).
+        // Replaces the old fixed Boost time window; the Boost window now tracks night mode, so
+        // "Boost active" == "not night". `ApsBoostStartTime`/`ApsBoostEndTime` are retired. (2026-07-02)
+        val nightEndMs = midnight + parseTimeToMillisOrDefault(preferences.getBoostDosing(StringKey.ApsBoostNightModeEnd), "07:00")
+
+        var boostActive = !isInNightSleepPeriod()
+        var disableReason = ""
+        if (!boostActive) disableReason = "Night/sleep period (night mode active by time or HR/steps)"
 
         val nowTime = java.time.Instant.ofEpochMilli(now).atZone(java.time.ZoneId.systemDefault()).toLocalTime()
-        debug.append("Boost window: $boostStartTime–$boostEndTime | Now: ${nowTime.format(DateTimeFormatter.ofPattern("HH:mm"))}")
-
-        if (boostStart > boostEnd) {
-            if (now > boostEnd) boostEnd += 86400000L
-            else boostStart -= 86400000L
-            debug.append(" (overnight wrap)")
-        }
-
-        var boostActive = now in boostStart until boostEnd
-        var disableReason = ""
-
-        if (!boostActive) {
-            disableReason = "Outside boost time window"
-        }
+        debug.append("Boost gate: night/sleep=${!boostActive} | Now: ${nowTime.format(DateTimeFormatter.ofPattern("HH:mm"))}")
 
         // Disable boost if high temp target and not allowed
         if (boostActive && tempTargetSet && !allowBoostWithHighTt && targetBg > dynIsfNormalTarget) {
@@ -516,21 +572,63 @@ open class OpenAPSBoostPlugin @Inject constructor(
             aapsLogger.debug(LTag.APS, "Boost disabled due to high temptarget of $targetBg")
         }
 
-        val recentSteps5Min = StepService.getRecentStepCount5Min()
-        val recentSteps15Min = StepService.getRecentStepCount15Min()
-        val recentSteps30Min = StepService.getRecentStepCount30Min()
-        val recentSteps60Min = StepService.getRecentStepCount60Min()
+        var recentSteps5Min = StepService.getRecentStepCount5Min()
+        var recentSteps15Min = StepService.getRecentStepCount15Min()
+        var recentSteps30Min = StepService.getRecentStepCount30Min()
+        var recentSteps60Min = StepService.getRecentStepCount60Min()
+        // F3 fix (2026-07-08): the live exercise classifier read PHONE StepService ONLY, so watch
+        // steps (wear AND Garmin, which land in the SC table) never influenced exercise state — a
+        // pre-existing gap that Garmin workstream B forced into the open. Blend the freshest watch
+        // SC row's trailing windows in ADDITIVELY (max): can only ADD activity detection, never
+        // remove protection. NOTE: this is a dosing-behaviour change (exercise state → activity
+        // target/gating) — backtest before relying on it beyond on-device validation.
+        run {
+            val recentSc = try {
+                persistenceLayer.getStepsCountFromTimeToTime(dateUtil.now() - 15 * 60_000L, dateUtil.now())
+            } catch (t: Throwable) { emptyList() }
+            recentSc.maxByOrNull { it.timestamp }?.let { sc ->
+                recentSteps5Min = maxOf(recentSteps5Min, sc.steps5min)
+                recentSteps15Min = maxOf(recentSteps15Min, sc.steps15min)
+                recentSteps30Min = maxOf(recentSteps30Min, sc.steps30min)
+                recentSteps60Min = maxOf(recentSteps60Min, sc.steps60min)
+            }
+        }
 
         debug.append("\nSteps: 5m=$recentSteps5Min 15m=$recentSteps15Min 30m=$recentSteps30Min 60m=$recentSteps60Min")
 
-        // Sleep-in detection
-        val inSleepInWindow = now in boostStart until (boostStart + sleepInMillis)
-        if (boostActive && inSleepInWindow && recentSteps60Min < sleepInSteps) {
+        // ── Step-source availability guard (F1, 2026-07-07) ──
+        // 0 steps from a feed that never reported is NOT sedentary — it's unknown. Available =
+        // phone pedometer LIVE this boot OR a wear SC row within the WearStepSource freshness
+        // window. When unavailable: no INACTIVE profile drop, no steps-based sleep-in, and the
+        // outage is breadcrumbed (debugReason + boostSteps_feed RT). See StepFeed KDoc.
+        val wearScRecent = try {
+            persistenceLayer.getStepsCountFromTimeToTime(now - WearStepSource.FRESH_MS, now)
+        } catch (t: Throwable) {
+            emptyList()
+        }
+        val stepFeed = StepFeed.State(
+            phoneLive = StepService.feedState() == StepService.FeedState.LIVE,
+            wearAgeMs = WearStepSource.latest(wearScRecent)?.let { now - it.timestamp }
+        )
+        val stepsAvailable = stepFeed.available
+        if (!stepsAvailable) debug.append("\n${stepFeed.unavailableNote()}")
+
+        // Steps-based sleep-in (lie-in). 2026-07-08 MERGE folded this into SleepStateDetector — when
+        // night-mode-auto-by-sleep is ON, the detector HOLDS SLEEPING through the lie-in window
+        // (nightEnd → nightEnd+sleepInHours) and releases on the SAME sleepInSteps threshold. This
+        // standalone gate is the FAILSAFE. It engages unless the detector is ACTIVELY holding sleep
+        // (auto-by-sleep ON *and* state == SLEEPING) — so it also covers the detector's documented
+        // false-AWAKE mode during the lie-in (previously the gate stood down for the whole window
+        // whenever auto-by-sleep was on, leaving a dawn false-AWAKE unprotected). sleepStateCached is
+        // last cycle's state (this cycle's is evaluated later); one-cycle (~5 min) lag is acceptable
+        // for a lie-in backstop.
+        val sleepInActive = StepFeed.sleepInActive(stepsAvailable, now, nightEndMs, sleepInMillis, recentSteps60Min, sleepInSteps)
+        val autoBySleepActive = preferences.get(BooleanKey.ApsBoostNightModeAutoBySleep)
+        val detectorSleeping = sleepStateCached.state == SleepStateDetector.SleepState.SLEEPING
+        if (boostActive && StepFeed.lieInFailsafeEngages(sleepInActive, autoBySleepActive, detectorSleeping)) {
             boostActive = false
-            disableReason = "Sleep-in (60m steps $recentSteps60Min < threshold $sleepInSteps, within ${sleepInHours}h of start)"
-            aapsLogger.debug(LTag.APS, "Boost disabled due to lie-in")
-        } else if (inSleepInWindow && boostActive) {
-            debug.append("\nSleep-in window active but overridden (steps $recentSteps60Min >= $sleepInSteps)")
+            disableReason = "Sleep-in failsafe (60m steps $recentSteps60Min < threshold $sleepInSteps, within ${sleepInHours}h of night end; auto-by-sleep=$autoBySleepActive detector=${sleepStateCached.state})"
+            aapsLogger.debug(LTag.APS, "Boost disabled due to lie-in (failsafe; auto-by-sleep=$autoBySleepActive detector=${sleepStateCached.state})")
         }
 
         var activityMinBg = minBg
@@ -631,9 +729,26 @@ open class OpenAPSBoostPlugin @Inject constructor(
                         debug.append("\nActivity detected (HR inconclusive: ${hrClassification.exerciseState}) → profile ${currentProfileSwitch}%, target $activityTargetBg")
                     }
                 }
-            } else if (currentProfileSwitch == 100 && recentSteps60Min < inactivitySteps) {
-                // Inactivity confirmed or no steps — check HR for stress
-                if (hrStressDetection &&
+            } else if (StepFeed.inactivityEligible(stepsAvailable, currentProfileSwitch, recentSteps60Min, inactivitySteps)) {
+                // Inactivity confirmed on a LIVE feed — check HR for stress. (F1 2026-07-07: a dark
+                // feed can no longer reach this branch — "no steps" must not mean "sedentary".)
+                if (hrIntegrationEnabled && HrActivityCalculator.inactivitySuppressedByElevatedHr(hrClassification)) {
+                    // 2026-07-21 CRITICAL SAFETY: an elevated HR (zone ≥ 3) with a low step count is
+                    // probable NON-STEP exercise (cycling, rowing, resistance). The inactivity branch
+                    // adds insulin (profile → inactivityPct); a real incident raised profile 130% at
+                    // zone3 while BG fell 12 mg/dL per 5 min because 64 steps landed in the classifier
+                    // dead zone and came back RESTING. Keying on the HR ZONE directly (not the fused
+                    // state), suppress the profile-raise entirely and raise the target instead.
+                    activityState = "RESISTANCE"
+                    val elevatedHrTarget = 160.0
+                    if (!tempTargetSet) {
+                        activityMinBg = elevatedHrTarget
+                        activityMaxBg = elevatedHrTarget
+                        activityTargetBg = elevatedHrTarget
+                    }
+                    aapsLogger.debug(LTag.APS, "Inactivity SUPPRESSED — HR elevated (${hrClassification?.hrZone?.label}, ${String.format("%.0f", hrClassification?.averageHrBpm ?: 0.0)} bpm) with low steps → non-step exercise; raising target to $elevatedHrTarget, profile UNCHANGED (NOT adding insulin)")
+                    debug.append("\nInactivity SUPPRESSED (HR ${hrClassification?.hrZone?.label} elevated, 60m steps $recentSteps60Min) → target $activityTargetBg, profile unchanged")
+                } else if (hrStressDetection &&
                     hrClassification?.exerciseState == HrActivityCalculator.ExerciseState.STRESS &&
                     hrClassification.confidence != HrActivityCalculator.Confidence.LOW
                 ) {
@@ -682,6 +797,12 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 }
                 aapsLogger.debug(LTag.APS, "Stress detected via HR (${hrClassification.hrZone.label}): raising target")
                 debug.append("\nStress (HR-only, ${hrClassification.hrZone.label}) → target $activityTargetBg, profile unchanged")
+            } else if (!stepsAvailable) {
+                // F1 (2026-07-07): feed dark and no HR-only classification fired — profile stays
+                // 100%, no target change. isActive is necessarily false here (no step data), so
+                // this is exactly the cycle set that previously mis-read as INACTIVE.
+                activityState = "steps-unknown"
+                debug.append("\nActivity: steps-unknown (feed unavailable — no INACTIVE, profile unchanged)")
             } else {
                 activityState = "normal"
                 debug.append("\nActivity: normal (no adjustment)")
@@ -701,7 +822,9 @@ open class OpenAPSBoostPlugin @Inject constructor(
             maxBg = activityMaxBg,
             targetBg = activityTargetBg,
             activityState = activityState,
-            debugReason = debug.toString()
+            debugReason = debug.toString(),
+            sleepInActive = sleepInActive,
+            stepsFeed = stepFeed.label
         )
     }
 
@@ -716,6 +839,24 @@ open class OpenAPSBoostPlugin @Inject constructor(
             } catch (_: DateTimeParseException) {
                 aapsLogger.error(LTag.APS, "Failed to parse time: $timeStr, defaulting to 0")
                 0L
+            }
+        }
+    }
+
+    /** [parseTimeToMillis] but falling back to [defaultStr] — NOT silently to midnight — on a
+     *  malformed pref. Midnight-on-typo moved the whole night window (night "ending" at 00:00 put
+     *  the sleep-in anchor at midnight and Boost fully active from 00:00 while asleep). (2026-07-02) */
+    private fun parseTimeToMillisOrDefault(timeStr: String, defaultStr: String): Long {
+        return try {
+            val time = LocalTime.parse(timeStr, DateTimeFormatter.ofPattern("H:mm"))
+            (time.hour * 3600000L) + (time.minute * 60000L)
+        } catch (_: DateTimeParseException) {
+            try {
+                val time = LocalTime.parse(timeStr, DateTimeFormatter.ofPattern("HH:mm"))
+                (time.hour * 3600000L) + (time.minute * 60000L)
+            } catch (_: DateTimeParseException) {
+                aapsLogger.error(LTag.APS, "Malformed night-mode time '$timeStr' — using default $defaultStr")
+                parseTimeToMillis(defaultStr)
             }
         }
     }
@@ -850,6 +991,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
         // 1. Activity detection & boost time window
         val activityResult = calculateBoostActivity(now, isTempTarget, targetBg, minBg, maxBg, profilePercent)
+        // Publish the step-based sleep-in state for next cycle's night-mode evaluation. (2026-07-02)
+        sleepInActiveCached = activityResult.sleepInActive
 
         // 1b. Post-exercise recovery transition detection
         // HR-aware: all exercise states (aerobic, resistance) trigger recovery, not just "ACTIVE".
@@ -950,8 +1093,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
         //        basal only). Gated by ApsBoostAutosensWhenNoTdd — default OFF (legacy: the curve
         //        ratio scales basal) until validated on the oref-vs-curve shadow telemetry logged below.
         val orefAutosensRatio = autosensResult.ratio     // real oref autosens (1.0 when autosens disabled)
-        val useTdd = preferences.get(BooleanKey.ApsBoostUseTdd)
-        val autosensWhenNoTdd = preferences.get(BooleanKey.ApsBoostAutosensWhenNoTdd)
+        val useTdd = preferences.getBoostDosing(BooleanKey.ApsBoostUseTdd)
+        val autosensWhenNoTdd = preferences.getBoostDosing(BooleanKey.ApsBoostAutosensWhenNoTdd)
         autosensResult.ratio = selectSensitivityRatio(useTdd, autosensWhenNoTdd, isfResult.ratio, orefAutosensRatio)
 
         // 5. Adjust basal if profile switch from activity
@@ -1026,7 +1169,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
             val nowLocal = java.time.LocalTime.now()
             val nowMin = nowLocal.hour * 60 + nowLocal.minute
             val offsetMs = java.time.ZoneId.systemDefault().rules.getOffset(java.time.Instant.now()).totalSeconds * 1000L
-            val leadMaxMin = preferences.get(DoubleKey.ApsBoostV6PreMealLeadMin).toInt()
+            val leadMaxMin = preferences.getBoostDosing(DoubleKey.ApsBoostV6PreMealLeadMin).toInt()
             val hit = MealTimeLearner.preMealWindow(mealTimeHistoryCached, nowMin, offsetMs, leadMaxMin) ?: return@run
             val exerciseNow = activityResult.activityState in setOf("ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE", "STRESS")
             val inRecovery = postExerciseRecoveryEnabled && now < recoveryWindowEnd
@@ -1034,9 +1177,9 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 v6PreMealReason = "V6 pre-meal SUPPRESSED (${if (exerciseNow) "exercise" else "recovery"}); "
                 return@run
             }
-            val preMealTarget = preferences.get(DoubleKey.ApsBoostV6PreMealTargetMgdl)
+            val preMealTarget = preferences.getBoostDosing(DoubleKey.ApsBoostV6PreMealTargetMgdl)
             val mealClock = formatClockMin(hit.mode.centreMin)
-            v6PreMealReason = if (preferences.get(BooleanKey.ApsBoostV6PreMealTarget)) {
+            v6PreMealReason = if (preferences.getBoostDosing(BooleanKey.ApsBoostV6PreMealTarget)) {
                 if (preMealTarget < v6TargetBg) {   // lower-only
                     v6MinBg = minOf(v6MinBg, preMealTarget)
                     v6MaxBg = minOf(v6MaxBg, preMealTarget)
@@ -1138,7 +1281,19 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
             // Debug context
             boostDebugReason = activityResult.debugReason,
-            isfDebugReason = isfResult.isfDebug
+            isfDebugReason = isfResult.isfDebug,
+
+            // V5/V6 exercise inputs (F2, 2026-07-07) — fill so OpenAPSBoostV5Plugin's decide() sees
+            // the live activity state. These fields were DEAD on the live path since the V6 plugin
+            // split: only the retired OpenAPSBoostV3MLG3Plugin ever set them, so V6's meal-score
+            // exercise damping (MealSignalScore.notExercisingTerm), the fastConfirm !exercising gate
+            // (MealHypothesis.step), and the AggressionBudget post-exercise damper had NEVER engaged
+            // live — the exercise-into-correction hypo class this batch targets. Mapping mirrors
+            // V3MLG3's exact block (OpenAPSBoostV3MLG3Plugin, v5_* assignments) via the shared
+            // helpers below ([v5ExerciseActive]/[v5InPostExerciseWindow]).
+            v5_exerciseActive = v5ExerciseActive(activityResult.activityState),
+            v5_inPostExerciseWindow = v5InPostExerciseWindow(postExerciseRecoveryEnabled, now, recoveryWindowEnd),
+            v5_exerciseSubclass = activityResult.activityState,
         )
 
         aapsLogger.debug(LTag.APS, ">>> Invoking determine_basal Boost <<<")
@@ -1156,7 +1311,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
         // in the last 60 min. Pulled from PersistenceLayer rather than synthesised from IOB —
         // IOB is decay-adjusted, but the rolling-window cap wants raw delivered amounts.
         // Filters to BS.Type.SMB so manual user boluses don't contribute.
-        val cumulativeSmbCap60Min = preferences.get(DoubleKey.ApsBoostCumulativeSmbCap60Min)
+        val cumulativeSmbCap60Min = preferences.getBoostDosing(DoubleKey.ApsBoostCumulativeSmbCap60Min)
         // v12 ML uses both the 60-min volume (already used by the cap) and the
         // minutes-since-last-SMB. Query a wider 12-hr window once and derive both.
         val (recentSmbVolume60Min, timeSinceLastSmbMin) = try {
@@ -1170,15 +1325,20 @@ open class OpenAPSBoostPlugin @Inject constructor(
             } ?: 720.0
             Pair(sum60, tSince)
         } catch (e: Exception) {
-            aapsLogger.warn(LTag.APS, "Boost V1 recent SMB volume query failed (${e.message}) — falling back to 0.0 / 720m (cap will not engage this cycle)")
-            Pair(0.0, 720.0)
+            // FAIL CLOSED (2026-07-02): a DB failure must not disarm the anti-stacking cap — treat the
+            // 60-min volume as AT the cap so both V1's internal cap and the V5-override re-check
+            // suppress SMB this cycle (basal control continues; SMBs resume when the query recovers).
+            // Previously fell open to 0.0 ("cap will not engage this cycle") — the backstop vanished
+            // exactly when state was already degraded. tSince stays 720 (neutral ML feature).
+            aapsLogger.error(LTag.APS, "Boost V1 recent SMB volume query failed (${e.message}) — FAIL CLOSED: treating 60-min volume as at-cap; SMB suspended this cycle")
+            Pair(if (cumulativeSmbCap60Min > 0.0) cumulativeSmbCap60Min else 0.0, 720.0)
         }
         aapsLogger.debug(LTag.APS, "Boost V1 cumulative SMB last 60min: ${recentSmbVolume60Min}U / cap ${cumulativeSmbCap60Min}U | minutes-since-last-SMB: ${timeSinceLastSmbMin}")
 
         // v12 ML lookback ring buffer — restore from storage once per process so the
         // lag0..lag5 windowed features survive an AAPS restart instead of cold-starting
         // (zero-imputed) for the first ~6 cycles. No-op after the first cycle.
-        determineBasalBoost.loadMlRingBufferOnce(preferences.get(StringKey.ApsBoostMlRingBuffer))
+        determineBasalBoost.loadMlRingBufferOnce(preferences.getBoostDosing(StringKey.ApsBoostMlRingBuffer))
 
         determineBasalBoost.determine_basal(
             glucose_status = glucoseStatus,
@@ -1235,6 +1395,21 @@ open class OpenAPSBoostPlugin @Inject constructor(
             // Prior-cycle sleep state (updated end-of-invoke). Passed into V5 so the fast-carb
             // fast-path is gated OFF overnight, and reused below for the dose-level sleep gate.
             val v5Asleep = sleepStateCached.state == SleepStateDetector.SleepState.SLEEPING
+            // Post-rescue window (2026-07-04; hoisted above runShadow 2026-07-06 so V5's composed-floor
+            // shadow can read it) — the SAME source value (recentLowBG45Min, computed once in step 6
+            // above and passed into determine_basal) and the SAME shared threshold as V1's Fix A v2
+            // post-rescue tier guard, so this flag is true exactly when V1's own dose is the
+            // hypo-restrained one. Logged every cycle as boostV5_postRescueWindow (shadow and active)
+            // so the 2026-07-10 live review can audit windows without CGM reconstruction.
+            val inPostRescueWindow = recentLowBG45Min < DetermineBasalBoost.POST_RESCUE_LOW_THRESHOLD_MGDL
+            it.boostV5_postRescueWindow = inPostRescueWindow
+            // Cumulative-cap telemetry (2026-07-06): the rolling-60-min anti-stacking cap and the
+            // volume it compares against were previously invisible in NS — a cap suppression looked
+            // identical to a zero-dose decision (2026-07-06 forensic). Written EVERY Boost cycle
+            // (shadow + active); the same recentSmbVolume60Min already computed above (fail-closed
+            // to at-cap on DB error, so the telemetry mirrors the operative value exactly).
+            it.boostV5_cumulativeCapU = cumulativeSmbCap60Min
+            it.boostV5_smbVol60Min = recentSmbVolume60Min
             val v5decision = try {
                 boostV5Plugin.get().runShadow(
                     rT = it,
@@ -1245,7 +1420,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     activeMode = v5Active,
                     microBolusAllowed = microBolusAllowed,
                     flatBGsDetected = flatBGsDetected,
-                    asleep = v5Asleep
+                    asleep = v5Asleep,
+                    postRescueWindow = inPostRescueWindow
                 )
             } catch (t: Throwable) {
                 aapsLogger.error(LTag.APS, "V5 shadow invocation failed", t)
@@ -1260,36 +1436,103 @@ open class OpenAPSBoostPlugin @Inject constructor(
             // returns — so re-check the SAME cap here (same prior-volume semantics as V1) or V5 could
             // deliver on a cycle V1 suspended for cumulative volume. (Review 2026-06-26, MEDIUM.)
             val cumulativeCapReached = cumulativeSmbCap60Min > 0.0 && recentSmbVolume60Min >= cumulativeSmbCap60Min
-            if (v5Active && microBolusAllowed && v5decision != null && !v5Asleep && !cumulativeCapReached) {
+            // Boost-inactive gate (2026-07-02): the V6/V5 override may replace the SMB ONLY when Boost
+            // is active this cycle. When boostActive is false — night/sleep period, high temp target, or
+            // the step-based sleep-in has fired — fall back to V1's base oref1 SMB (which respects night
+            // mode + its own hypo/minGuard gates) instead of the amplified V5 dose. Without this, a
+            // genuinely-asleep, zero-step cycle could still receive a full V5 meal-amplified bolus,
+            // because v5Asleep reflects ONLY the HR sleep-state machine, never the boost-window gate.
+            if (v5Active && microBolusAllowed && v5decision != null && !v5Asleep && !cumulativeCapReached && activityResult.boostActive) {
                 val v1WouldDose = it.units ?: 0.0
-                it.units = v5decision.finalDose
-                it.reason.append("V6-ACTIVE drove SMB ${Round.roundTo(v5decision.finalDose, 0.001)}U (base would=${Round.roundTo(v1WouldDose, 0.001)}U, state=${v5decision.mealHypothesis}); ")
-                aapsLogger.info(LTag.APS, "V6-ACTIVE override: SMB ${v1WouldDose} → ${v5decision.finalDose} state=${v5decision.mealHypothesis}")
+                // Non-meal-state cap (2026-07-02): V6 may only OUT-dose V1 when it holds a meal
+                // hypothesis (CONFIRMED/COMMITTED). In IDLE/OBSERVING/RECOVERING the V5 state caps
+                // don't apply (applyStateDoseCap passes them through) and IDLE's 1.0× multiplier can
+                // front a multi-unit correction that bypasses V1's per-SMB sizing — 5-month cohort
+                // shadow data: ~1,430U cumulative IDLE excess over V1, worst 3.7U vs 0.45U at BG 210,
+                // incl. 2.0U at 05:02 where V1 dosed 0. Capping at V1's would-dose makes IDLE match
+                // its own spec ("standard oref dose; no meal hypothesis"); genuine meal rises still
+                // get full V6 dosing via OBSERVING→CONFIRMED.
+                // 2026-07-17 velocity-budget floor exemption: when the ACTIVE velocity-budget floor
+                // lifted this cycle's dose (velocityBudgetExempt), treat it as a meal state so the
+                // floored hold can out-dose V1 on the budget≈0 high tail (V1 doses ~0 there). Safe by
+                // construction: the exempt dose is committedCap + maxIOB bounded, the floor requires
+                // !postRescueWindow, and the cumulative-60min / boost-active / sleep gates all still run.
+                val inMealState = v5decision.mealHypothesis == MealHypothesis.CONFIRMED ||
+                    v5decision.mealHypothesis == MealHypothesis.COMMITTED ||
+                    v5decision.velocityBudgetExempt
+                // Post-rescue meal-state cap (2026-07-04): inside the post-rescue window the meal-state
+                // exemption is suppressed and CONFIRMED/COMMITTED are ALSO capped at V1's would-dose —
+                // which is hypo-restrained by V1's aligned tier guard (same value, same threshold; see
+                // applyV6OverrideCaps KDoc for the 2026-07-03 nadir-40 incident + backtest evidence:
+                // 27% of the removed insulin sits ahead of a second low <70 vs 14-19% for other levers;
+                // cost 10% genuine post-hypo meals at 0.15U median under-delivery).
+                val caps = applyV6OverrideCaps(inMealState, inPostRescueWindow, v5decision.finalDose, v1WouldDose, recentLowBG45Min)
+                val overrideDose = caps.dose
+                it.units = overrideDose
+                it.reason.append("V6-ACTIVE drove SMB ${Round.roundTo(overrideDose, 0.001)}U (base would=${Round.roundTo(v1WouldDose, 0.001)}U, state=${v5decision.mealHypothesis}${caps.capNote}); ")
+                aapsLogger.info(LTag.APS, "V6-ACTIVE override: SMB ${v1WouldDose} → ${overrideDose} state=${v5decision.mealHypothesis}${caps.capNote}")
+                // 2026-07 composed brake-floor breadcrumb: when the Advanced toggle is ON,
+                // decision.floorWouldAdd carries the uplift the floor actually APPLIED (active
+                // semantics — see V5Decision KDoc). Log the un-floored→floored delivery so a
+                // floored cycle is auditable straight from the reason line. Whenever the uplift
+                // is > 0 the floored dose is inside every seam cap by construction (RECOVERING
+                // v1-bound + !postRescueWindow are conditions of the floor itself), so
+                // overrideDose == v5decision.finalDose here and X→Y is the delivered truth.
+                val floorUplift = if (preferences.getBoostDosing(BooleanKey.ApsBoostV5ComposedFloorActive)) v5decision.floorWouldAdd ?: 0.0 else 0.0
+                if (floorUplift > 0.0) {
+                    it.reason.append("brake-floor applied: ${Round.roundTo(v5decision.finalDose - floorUplift, 0.001)}→${Round.roundTo(v5decision.finalDose, 0.001)} U; ")
+                    aapsLogger.info(LTag.APS, "V6 brake-floor applied: ${Round.roundTo(v5decision.finalDose - floorUplift, 0.001)}→${Round.roundTo(v5decision.finalDose, 0.001)} U")
+                }
+                // 2026-07-17 velocity-budget floor breadcrumb: when ON, decision.velocityBudgetWouldAdd
+                // carries the uplift actually APPLIED (out-dosing V1 on the budget≈0 tail via the
+                // non-meal-cap exemption). overrideDose == v5decision.finalDose here (the exemption made
+                // inMealState true), so X→Y is the delivered truth.
+                val vbUplift = if (preferences.getBoostDosing(BooleanKey.ApsBoostV5VelocityBudgetActive)) v5decision.velocityBudgetWouldAdd ?: 0.0 else 0.0
+                if (vbUplift > 0.0) {
+                    it.reason.append("velocity-budget floor applied: ${Round.roundTo(v5decision.finalDose - vbUplift, 0.001)}→${Round.roundTo(v5decision.finalDose, 0.001)} U (base insulinReq≈0); ")
+                    aapsLogger.info(LTag.APS, "V6 velocity-budget floor applied: ${Round.roundTo(v5decision.finalDose - vbUplift, 0.001)}→${Round.roundTo(v5decision.finalDose, 0.001)} U")
+                }
             } else if (v5Active && v5decision != null && cumulativeCapReached) {
                 it.units = 0.0
                 it.reason.append("V6 suppressed (cumulative SMB cap ${Round.roundTo(recentSmbVolume60Min, 0.01)}U/${Round.roundTo(cumulativeSmbCap60Min, 0.01)}U reached); ")
                 aapsLogger.info(LTag.APS, "V6-ACTIVE cumulative SMB cap reached (${recentSmbVolume60Min}/${cumulativeSmbCap60Min}U) — SMB suspended")
             } else if (v5Active && v5Asleep && v5decision != null) {
                 it.reason.append("V6 suppressed (SLEEPING) — base SMB ${Round.roundTo(it.units ?: 0.0, 0.001)}U; ")
+            } else if (v5Active && v5decision != null && !activityResult.boostActive) {
+                it.reason.append("V6 override skipped (Boost inactive) — base SMB ${Round.roundTo(it.units ?: 0.0, 0.001)}U; ")
+                aapsLogger.info(LTag.APS, "V6-ACTIVE override skipped — Boost inactive; base oref1 SMB ${it.units ?: 0.0}U retained")
             }
 
             // V6: surface the anticipatory pre-meal target decision computed earlier this cycle.
             v6PreMealReason?.let { r -> it.reason.append(r) }
             // V6 meal-time learner: record a FRESH CONFIRMED commit (the event V5 treats as a meal)
             // so the pre-meal window learns this user's habitual meal times. Persist only on change.
-            if (v5decision != null && v5decision.mealHypothesis.name == "CONFIRMED" && v5decision.mealHypothesisAge == 0) {
+            if (v5decision != null && v5decision.mealHypothesis == MealHypothesis.CONFIRMED && v5decision.mealHypothesisAge == 0) {
                 mealTimeHistoryCached = MealTimeLearner.record(mealTimeHistoryCached, now)
                 preferences.put(StringKey.ApsBoostMealTimeHistory, mealTimeHistoryCached.serialize())
                 aapsLogger.debug(LTag.APS, "V6 meal-time learner: recorded CONFIRMED @ ${dateUtil.dateAndTimeString(now)} (${mealTimeHistoryCached.events.size} events)")
             }
+
+            // Step-feed availability telemetry (F1, 2026-07-07) — written EVERY cycle so a dark
+            // feed is visible in NS ("none" = INACTIVE + sleep-in suppressed this cycle).
+            it.boostSteps_feed = activityResult.stepsFeed
+            // F6 (2026-07-07): step-feed edge detection — reason-line only (steps degrade
+            // gracefully via F1's guard, so no notification; the transition just needs to be
+            // findable in NS next to the cycles it affected).
+            val prevStepsFeed = lastStepsFeed
+            if (prevStepsFeed != null && prevStepsFeed != activityResult.stepsFeed) {
+                it.reason.append("stepsFeed: $prevStepsFeed→${activityResult.stepsFeed}; ")
+                aapsLogger.info(LTag.APS, "Boost step feed changed: $prevStepsFeed → ${activityResult.stepsFeed}")
+            }
+            lastStepsFeed = activityResult.stepsFeed
 
             // 2026-06-02: Sleep state evaluation. Runs at end of invoke so we have
             // mlMealLikely from this cycle. State persists across plugin restarts via
             // StringKey.ApsBoostSleepState. Updates sleepStateCached so the next
             // isNightModeActive() call sees the fresh state.
             try {
-                val configuredNightStartMin = parseTimeToMinutesOfDay(preferences.get(StringKey.ApsBoostNightModeStart))
-                val configuredNightEndMin = parseTimeToMinutesOfDay(preferences.get(StringKey.ApsBoostNightModeEnd))
+                val configuredNightStartMin = parseTimeToMinutesOfDay(preferences.getBoostDosing(StringKey.ApsBoostNightModeStart))
+                val configuredNightEndMin = parseTimeToMinutesOfDay(preferences.getBoostDosing(StringKey.ApsBoostNightModeEnd))
                 val nowLocal = java.time.LocalTime.now()
                 val minOfDay = nowLocal.hour * 60 + nowLocal.minute
 
@@ -1311,6 +1554,17 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
                 // 30-min window for HR — sufficient for both 5-min and 15-min avgs and sleep eval.
                 val hrReadingsForSleep = persistenceLayer.getHeartRatesFromTime(now - 30 * 60_000L)
+                // Lump-tolerant wake evidence (2026-07-03): the detector needs today's CUMULATIVE
+                // steps (max of wear-reconstructed and phone) — wear-bridge steps arrive in batches
+                // the phone's 15-min bucket never sees (the phone sits on the nightstand overnight),
+                // which is why the 06:00 wake was missed and every wake was boundary-forced.
+                val sleepTodayIdx = DailyStepHistoryTracker.dayIndex(now, localOffsetMs)
+                val sleepDayStartMs = sleepTodayIdx * 86_400_000L - localOffsetMs
+                val scTodayForSleep = try { persistenceLayer.getStepsCountFromTimeToTime(sleepDayStartMs, now) } catch (t: Throwable) { emptyList() }
+                val stepsTodayForSleep = maxOf(
+                    WearStepSource.stepsToday(scTodayForSleep, sleepDayStartMs, now),
+                    StepService.getStepsToday(localOffsetMs)
+                )
                 val sleepResult = SleepStateDetector.evaluate(
                     prev = sleepStateCached,
                     inputs = SleepStateDetector.Inputs(
@@ -1323,9 +1577,10 @@ open class OpenAPSBoostPlugin @Inject constructor(
                         mlMealLikely = it.mlMealLikely,
                         nightStartMin = effectiveNightStartMin,
                         nightEndMin = effectiveNightEndMin,
-                        preSleepLeadMin = preferences.get(IntKey.ApsBoostPreSleepLeadMin),
-                        minSleepHysteresisMin = preferences.get(IntKey.ApsBoostSleepHysteresisMin),
-                        wakeHrHysteresisMin = preferences.get(IntKey.ApsBoostWakeHrHysteresisMin)
+                        preSleepLeadMin = preferences.getBoostDosing(IntKey.ApsBoostPreSleepLeadMin),
+                        minSleepHysteresisMin = preferences.getBoostDosing(IntKey.ApsBoostSleepHysteresisMin),
+                        wakeHrHysteresisMin = preferences.getBoostDosing(IntKey.ApsBoostWakeHrHysteresisMin),
+                        stepsToday = stepsTodayForSleep
                     ),
                     aapsLogger = aapsLogger
                 )
@@ -1394,6 +1649,14 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 val avg15 = SleepStateDetector.averageHr(hrReadingsForSleep, now, 15)
                 if (avg5 != null) it.hrBpmAvg5m = Round.roundTo(avg5, 0.1)
                 if (avg15 != null) it.hrBpmAvg15m = Round.roundTo(avg15, 0.1)
+                // F5 (2026-07-07) transient visibility: 15-min averaging blunts hypo-tachycardia
+                // (+1.5 vs +13.6 bpm, 2026-07-06 analysis) — emit the 5-min extremes of the 1-min
+                // rows so the transient survives into NS for retrospective modelling.
+                val hrRows5m = hrReadingsForSleep.filter { hr -> hr.isValid && hr.timestamp > now - 5 * 60_000L }
+                if (hrRows5m.isNotEmpty()) {
+                    it.hrBpmMax5m = Round.roundTo(hrRows5m.maxOf { hr -> hr.beatsPerMinute }, 0.1)
+                    it.hrBpmMin5m = Round.roundTo(hrRows5m.minOf { hr -> hr.beatsPerMinute }, 0.1)
+                }
                 it.hrReadingsCount15m = hrReadingsForSleep.count { hr ->
                     hr.isValid && hr.timestamp > now - 15 * 60_000L
                 }
@@ -1404,6 +1667,23 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 )
                 it.hrSource_resolved = hrRes.active
                 it.hrSource_states = hrRes.note
+                // F4 phone side (2026-07-07): edge-detect the whole feed going dark (anyFresh
+                // true→false) — one reason-line note naming the last device + age — and after 60
+                // consecutive dark minutes during 08:00-22:00 local, one low-priority notification
+                // per dark episode (the wear watchdog re-registers the sensor; this covers every
+                // other silent-death mode: BT drop, Garmin app dead, watch off wrist).
+                val darkEvent = hrFeedDarkTracker.onCycle(hrRes, now, java.time.LocalTime.now().hour)
+                darkEvent.wentDarkNote?.let { note ->
+                    aapsLogger.warn(LTag.APS, note)
+                    it.reason.append("$note; ")
+                }
+                if (darkEvent.raiseNotification) {
+                    uiInteraction.addNotification(
+                        Notification.USER_MESSAGE,
+                        "Boost: heart-rate feed has been dark for ${darkEvent.darkMinutes} min — check the watch/Garmin connection",
+                        Notification.LOW
+                    )
+                }
 
                 it.reason.append("sleep=${sleepResult.newState.state}")
                 if (agg.sleepStartMinAvg != null) {
@@ -1416,7 +1696,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
             // ── Activity-load SHADOW (2026-06-16): learn the personal step baseline + compute what
             // an activity/inactivity ISF modifier WOULD do, and LOG it. Never applied to dosing. ──
-            if (preferences.get(BooleanKey.ApsBoostActivityShadowEnabled)) {
+            if (preferences.getBoostDosing(BooleanKey.ApsBoostActivityShadowEnabled)) {   // 2026-07-08: raw read (Simple-Mode mask bypass)
                 try {
                     val offsetMs = java.time.ZoneId.systemDefault().rules.getOffset(java.time.Instant.now()).totalSeconds * 1000L
                     val todayIdx = DailyStepHistoryTracker.dayIndex(now, offsetMs)
@@ -1428,6 +1708,10 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     // one source dying no longer starves the baseline (the 2026-06-27 failure).
                     for ((rawSrc, totals) in healthConnectStepsIngest.allSourceDailyTotals)
                         multi = DailyStepHistoryTracker.mergeSource(multi, rawSrc, totals, todayIdx)
+                    // Backfill the PHONE anchor from HC's phone-sensor (device.type==PHONE) history so the
+                    // phone-anchored baseline is full-window at once, not accrued one day per midnight.
+                    val hcPhone = healthConnectStepsIngest.phoneDailyTotals
+                    if (hcPhone.isNotEmpty()) multi = DailyStepHistoryTracker.mergeSource(multi, StepSourceResolver.PHONE, hcPhone, todayIdx)
                     // Wear: derive completed-day totals from the SC table (throttled — daily totals are
                     // stable within an hour, and a 28-day SC read is heavy at the 5-min cycle cadence).
                     if (now - lastWearDailyMs >= 60 * 60_000L) {
@@ -1447,16 +1731,39 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     val wearToday = WearStepSource.stepsToday(todaySc, dayStartMs, now)
                     val phoneToday = StepService.getStepsToday(offsetMs)
 
-                    // The phone pedometer has no persistent daily feed; keep a rolling completed-day
-                    // ledger so it can serve as an active source with CALIBRATED bridging (else a phone
-                    // takeover after a watch dies would splice donor days raw and risk false inactivity).
-                    if (phoneDayCached != todayIdx) {
-                        if (phoneDayCached >= 0 && phoneMaxCached > 0)
-                            multi = DailyStepHistoryTracker.mergeSource(multi, StepSourceResolver.PHONE,
-                                listOf(DailyStepHistoryTracker.DailyTotal(phoneDayCached, phoneMaxCached, StepSourceResolver.PHONE)), todayIdx)
-                        phoneDayCached = todayIdx; phoneMaxCached = 0
+                    // ── Intraday running-max BANK (2026-07-07) — day-close never reads live counts.
+                    // The 07-06 recurrence (despite hold-higher): wear peaked 4142 at 22:58 BST,
+                    // the wear counter reset at DEVICE midnight 23:04, and the day closed at 739
+                    // (phone) — wear's candidate was already 0 at the moment of resolution. Bank
+                    // per-source maxima every cycle (wear/phone native units; HC sources only when
+                    // HC's today value is for the CURRENT local day); on rollover the completed
+                    // day is merged from the BANK. Persisted so an app restart keeps the peak.
+                    // Replaces the old phone-only in-memory ledger (phoneDayCached/phoneMaxCached).
+                    val bankCounts = LinkedHashMap<String, Int>()
+                    bankCounts[StepSourceResolver.WEAR] = wearToday
+                    bankCounts[StepSourceResolver.PHONE] = phoneToday
+                    if (healthConnectStepsIngest.todayStepsDay == todayIdx)
+                        for ((rawSrc, t) in healthConnectStepsIngest.todayStepsBySource) {
+                            val c = StepSourceResolver.canonical(rawSrc)
+                            if (c == StepSourceResolver.WEAR || c == StepSourceResolver.PHONE) continue
+                            bankCounts[c] = maxOf(bankCounts[c] ?: 0, t)
+                        }
+                    val banked = DailyStepHistoryTracker.bankCycle(stepBankCached, todayIdx, bankCounts)
+                    stepBankCached = banked.bank
+                    val bankSerialized = banked.bank.serialize()
+                    if (bankSerialized != lastStepBankSerialized) {
+                        preferences.put(StringKey.ApsBoostIntradayStepBank, bankSerialized)
+                        lastStepBankSerialized = bankSerialized
                     }
-                    if (phoneToday > phoneMaxCached) phoneMaxCached = phoneToday
+                    if (banked.closedDayTotals.isNotEmpty()) {
+                        for (t in banked.closedDayTotals)
+                            multi = DailyStepHistoryTracker.mergeSource(multi, t.source, listOf(t), todayIdx)
+                        // Breadcrumb AT the rollover cycle (the 07-06 close was silent): what each
+                        // source banked. The held-X-over-Y resolution line follows from
+                        // phoneAnchoredWindow below on this same cycle, now with banked values.
+                        it.reason.append("stepHistory: day-close banked ${banked.closedDayTotals.joinToString(", ") { t -> "${t.source} ${t.steps}" }}; ")
+                        aapsLogger.info(LTag.APS, "Boost step day-close (banked): ${banked.closedDayTotals.joinToString(", ") { t -> "${t.source} ${t.steps}" }}")
+                    }
 
                     if (multi.sources != multiStepHistoryCached.sources) {
                         multiStepHistoryCached = multi
@@ -1464,9 +1771,18 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     }
 
                     // ── Auto-resolve today's active source (no UI) ──
+                    // Wear "fresh" uses the RESOLUTION grace window (2026-07-07): strict 12-min
+                    // freshness flapped today's count wear↔phone every 2-3 cycles overnight (the
+                    // resolver prefers the highest-trust FRESH source, so each brief wear-quiet
+                    // spell handed the count to the live-but-tiny phone: 349↔32 in the 07-06/07
+                    // telemetry). The wear today-count is rebuilt from the day's SC rows, so it
+                    // stays valid across a short quiet spell. Phone "fresh" = the pedometer has
+                    // actually reported this boot (F9, 2026-07-07) — `phoneToday > 0` conflated
+                    // "no data" with "no steps yet today" (false at midnight, false after reboot
+                    // until the user moves, and never true on a phone whose sensor is dead).
                     val states = mutableListOf<StepSourceResolver.SourceState>()
-                    states += StepSourceResolver.SourceState(StepSourceResolver.WEAR, WearStepSource.isFresh(todaySc, now), multi.sources[StepSourceResolver.WEAR]?.days?.size ?: 0, wearToday)
-                    states += StepSourceResolver.SourceState(StepSourceResolver.PHONE, phoneToday > 0, multi.sources[StepSourceResolver.PHONE]?.days?.size ?: 0, phoneToday)
+                    states += StepSourceResolver.SourceState(StepSourceResolver.WEAR, WearStepSource.isRecentlyFresh(todaySc, now), multi.sources[StepSourceResolver.WEAR]?.days?.size ?: 0, wearToday)
+                    states += StepSourceResolver.SourceState(StepSourceResolver.PHONE, StepService.feedState() == StepService.FeedState.LIVE, multi.sources[StepSourceResolver.PHONE]?.days?.size ?: 0, phoneToday)
                     for ((rawSrc, t) in healthConnectStepsIngest.todayStepsBySource) {
                         val c = StepSourceResolver.canonical(rawSrc)
                         if (c == StepSourceResolver.WEAR || c == StepSourceResolver.PHONE) continue
@@ -1474,8 +1790,12 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     }
                     val res = StepSourceResolver.resolve(states)
 
-                    // ── Baseline from the bridged rolling window (in the active source's units) ──
-                    val bridged = DailyStepHistoryTracker.bridgedWindow(multi, res.active, todayIdx)
+                    // ── Baseline from the PHONE-ANCHORED rolling window. The phone is the one source
+                    //    that runs continuously across watch SWAPS (one watch ceases as the next
+                    //    starts → they never overlap), so it is the calibration frame; worn sources
+                    //    are scaled into phone units. (Replaces watch-to-watch bridging, which could
+                    //    never calibrate a swap.) ──
+                    val bridged = DailyStepHistoryTracker.phoneAnchoredWindow(multi, todayIdx)
                     val sf = DailyStepHistoryTracker.shadowFactors(bridged.history, todayIdx)
                     it.boostActivityLoad_baselineSteps = sf.baselineSteps
                     it.boostActivityLoad_lastDaySteps = sf.lastDaySteps
@@ -1484,8 +1804,12 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     it.boostActivityLoad_source = res.active
                     it.boostActivitySource_resolved = res.active
                     it.boostActivitySource_states = res.note
-                    it.boostActivitySource_bridge = if (bridged.donorsUsed.isEmpty()) "none"
-                        else bridged.donorsUsed.joinToString("+") + if (bridged.calibrated) "" else "(raw)"
+                    it.boostActivitySource_bridge = if (bridged.donorsUsed.isEmpty()) "phone"
+                        else "phone<-" + bridged.donorsUsed.joinToString("+") + if (bridged.calibrated) "" else "(raw)"
+                    // Hold-higher reconcile breadcrumb (2026-07-03): make the yesterday-total
+                    // resolution visible in NS — the 07-02 undercount (wear 6224 recorded as 2227)
+                    // was invisible because nothing logged which source's count won the day.
+                    bridged.heldNote?.let { hn -> it.reason.append("stepHistory: $hn; ") }
                     if (sf.baselineSteps != null && sf.ratio != null) {
                         val sign = if (sf.wouldDeltaIsfPct >= 0) "+" else ""
                         it.reason.append("activityLoad: ${res.active ?: "none"} base ${sf.baselineSteps} last ${sf.lastDaySteps} (${Round.roundTo(sf.ratio!!, 0.01)}x) wouldΔISF $sign${Round.roundTo(sf.wouldDeltaIsfPct, 0.1)}% [${sf.note}] bridge[${it.boostActivitySource_bridge}]; ")
@@ -1493,9 +1817,11 @@ open class OpenAPSBoostPlugin @Inject constructor(
                         it.reason.append("activityLoad: no baseline (src[${res.note}]); ")
                     }
 
-                    // ── Intraday "running hot?" from the active source's today total vs typical pace ──
+                    // ── Intraday "running hot?" — today's count converted to PHONE units so it matches
+                    //    the phone-anchored baseline (worn-source today × phone/worn calibration). ──
                     val intraHour = java.time.LocalTime.now().hour
-                    val intra = DailyStepHistoryTracker.intradayFactor(res.stepsToday, sf.baselineSteps, intraHour)
+                    val stepsTodayPhone = DailyStepHistoryTracker.toPhoneUnits(res.stepsToday, res.active, multi)
+                    val intra = DailyStepHistoryTracker.intradayFactor(stepsTodayPhone, sf.baselineSteps, intraHour)
                     it.boostActivityLoad_stepsToday = res.stepsToday
                     it.boostActivityLoad_stepsSource = res.active
                     it.boostActivityLoad_intradayRatio = intra.ratio?.let { r -> Round.roundTo(r, 0.01) }
@@ -1589,30 +1915,75 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
     // ---- Night Mode ----
 
-    private var lastNightModeRun: Long = 0
-    private var lastNightModeResult: Boolean = false
+    // @Volatile (2026-07-02): read from the constraint path (isSMBModeEnabled) on non-loop threads;
+    // without a happens-before edge a racing reader could pair a fresh timestamp with a stale result
+    // and return "not night" on a night cycle (SMB let through). Benign worst case now: recompute.
+    @Volatile private var lastNightModeRun: Long = 0
+    @Volatile private var lastNightModeResult: Boolean = false
 
     // ---- Sleep state (2026-06-02) ----
     // Updated at end of invoke() once HR + steps + mlMealLikely are known. Read by
     // isNightModeActiveImpl() when ApsBoostNightModeAutoBySleep is enabled.
     @Volatile private var sleepStateCached: SleepStateDetector.State =
-        SleepStateDetector.State.deserialize(preferences.get(StringKey.ApsBoostSleepState))
+        SleepStateDetector.State.deserialize(preferences.getBoostDosing(StringKey.ApsBoostSleepState))
     @Volatile private var sleepHistoryCached: SleepHistoryTracker.History =
-        SleepHistoryTracker.History.deserialize(preferences.get(StringKey.ApsBoostSleepHistory))
+        SleepHistoryTracker.History.deserialize(preferences.getBoostDosing(StringKey.ApsBoostSleepHistory))
     // V6 meal-time learner — rolling 60-day history of V5-CONFIRMED meal commits. Loaded once at
     // construction; updated at end of invoke() when a fresh CONFIRMED fires, persisted on change.
     @Volatile private var mealTimeHistoryCached: MealTimeLearner.History =
-        MealTimeLearner.History.deserialize(preferences.get(StringKey.ApsBoostMealTimeHistory))
+        MealTimeLearner.History.deserialize(preferences.getBoostDosing(StringKey.ApsBoostMealTimeHistory))
     // Activity-load SHADOW — rolling 28-day PER-SOURCE daily-step history (multi-source abstraction
     // 2026-06-28; deserialize auto-migrates the old single-source blob). Persisted under the same key.
     @Volatile private var multiStepHistoryCached: DailyStepHistoryTracker.MultiSourceHistory =
-        DailyStepHistoryTracker.MultiSourceHistory.deserialize(preferences.get(StringKey.ApsBoostDailyStepHistory))
+        DailyStepHistoryTracker.MultiSourceHistory.deserialize(preferences.getBoostDosing(StringKey.ApsBoostDailyStepHistory))
     @Volatile private var lastWearDailyMs = 0L          // throttle the 28-day Wear SC read to hourly
-    @Volatile private var phoneDayCached = -1L          // phone completed-day ledger (no persistent phone feed)
-    @Volatile private var phoneMaxCached = 0
+    // Intraday step bank (2026-07-07): per-source running max of today's counts, persisted so a
+    // mid-evening app restart keeps the day's peak. Day-close resolves from THIS, never from
+    // post-reset live reads (the 07-06 device-midnight wear reset undercount).
+    @Volatile private var stepBankCached: DailyStepHistoryTracker.IntradayStepBank =
+        DailyStepHistoryTracker.IntradayStepBank.deserialize(preferences.getBoostDosing(StringKey.ApsBoostIntradayStepBank))
+    @Volatile private var lastStepBankSerialized: String? = null   // write-avoidance cache
     // Cached learned daytime baseline (used by HrActivityCalculator in current cycle from prior
     // cycle's aggregate computation — 5-min lag is acceptable, baseline changes slowly).
     @Volatile private var hrLearnedDaytimeBpmCached: Int? = null
+
+    // Step-based sleep-in (lie-in) state from the most recent calculateBoostActivity() (2026-07-02).
+    // Read by isNightModeActiveImpl() so a lie-in applies the user's night-mode SMB rules. The SMB
+    // constraint is evaluated earlier in invoke() than calculateBoostActivity() runs, so this holds
+    // the PREVIOUS cycle's value — a one-cycle (~5 min) lag that is safe: it errs toward keeping night
+    // mode on one extra cycle when waking, and the boostActive override gate already blocks the
+    // amplified V5 dose on the entering cycle regardless.
+    @Volatile private var sleepInActiveCached: Boolean = false
+
+    /**
+     * Pre-BG-gate "user is in their night/sleep period" — the night time window OR HR/step sleep
+     * detection, gated by the night-mode master toggle. This is the sleep-aware signal that gates the
+     * Boost window (boostActive = !this). It deliberately EXCLUDES the BG / COB / low-TT gates that
+     * [isNightModeActiveImpl] layers on for the SMB-suppression decision: those must NOT influence the
+     * Boost window, or a nocturnal high would flip Boost back on and re-fire a V6 dose while asleep.
+     * (2026-07-02)
+     */
+    private fun isInNightSleepPeriod(): Boolean {
+        if (!preferences.getBoostDosing(BooleanKey.ApsBoostNightModeEnabled)) return false
+        val now = System.currentTimeMillis()
+        val midnight = now - MidnightUtils.milliSecFromMidnight(now)
+        val start = midnight + parseTimeToMillisOrDefault(preferences.getBoostDosing(StringKey.ApsBoostNightModeStart), "22:00")
+        val end = midnight + parseTimeToMillisOrDefault(preferences.getBoostDosing(StringKey.ApsBoostNightModeEnd), "07:00")
+        // Equal-times guard (2026-07-02): with start==end the wrap-branch union covers the whole
+        // day → always-night → Boost/V6 silently never doses. Treat as an EMPTY time window
+        // (mathematically a zero-length interval); HR/step sleep detection + the steps lie-in
+        // backstop still protect the night.
+        if (start == end) {
+            aapsLogger.error(LTag.APS, "Night-mode start == end — treating time window as empty (sleep detection still active)")
+            return preferences.getBoostDosing(BooleanKey.ApsBoostNightModeAutoBySleep) &&
+                sleepStateCached.state != SleepStateDetector.SleepState.AWAKE
+        }
+        val active = if (end > start) now in start until end
+        else (now in (start - 86400000) until end || now in start until (end + 86400000))
+        val autoBySleep = preferences.getBoostDosing(BooleanKey.ApsBoostNightModeAutoBySleep)
+        val sleepActive = autoBySleep && sleepStateCached.state != SleepStateDetector.SleepState.AWAKE
+        return active || sleepActive
+    }
 
     private fun isNightModeActive(): Boolean {
         val currentTimeMillis = System.currentTimeMillis()
@@ -1624,36 +1995,25 @@ open class OpenAPSBoostPlugin @Inject constructor(
     }
 
     private fun isNightModeActiveImpl(): Boolean {
-        if (!preferences.get(BooleanKey.ApsBoostNightModeEnabled)) return false
+        if (!preferences.getBoostDosing(BooleanKey.ApsBoostNightModeEnabled)) return false
 
         val bgCurrent = glucoseStatusCalculatorSMB.getGlucoseStatusData(true)?.glucose ?: return false
 
-        val now = System.currentTimeMillis()
-        val midnight = now - MidnightUtils.milliSecFromMidnight(now)
-        val startStr = preferences.get(StringKey.ApsBoostNightModeStart)
-        val endStr = preferences.get(StringKey.ApsBoostNightModeEnd)
-        val start = midnight + parseTimeToMillis(startStr)
-        val end = midnight + parseTimeToMillis(endStr)
-        val active = if (end > start) now in start until end
-        else (now in (start - 86400000) until end || now in start until (end + 86400000))
-
-        // 2026-06-02 HYBRID: when ApsBoostNightModeAutoBySleep is on, sleep state can both
-        // EXTEND the active window (still SLEEPING past nightEnd) and ENABLE it early
-        // (PRE_SLEEP within the lead window, or SLEEPING during the outer window). When
-        // off, behaviour is the legacy time-window check.
-        val autoBySleep = preferences.get(BooleanKey.ApsBoostNightModeAutoBySleep)
-        val sleepActive = autoBySleep && sleepStateCached.state != SleepStateDetector.SleepState.AWAKE
-
-        if (!active && !sleepActive) return false
+        // Night by time window OR HR/step sleep detection (isInNightSleepPeriod, which also honours
+        // ApsBoostNightModeAutoBySleep — extending past nightEnd while still SLEEPING and enabling early
+        // on PRE_SLEEP), OR the step-based lie-in surfaced from calculateBoostActivity so night-mode SMB
+        // rules also apply during a morning lie-in. (sleepInActiveCached lags one cycle; see its
+        // declaration.) (2026-07-02)
+        if (!isInNightSleepPeriod() && !sleepInActiveCached) return false
 
         // Disable night mode when COB > 0
-        if (preferences.get(BooleanKey.ApsBoostNightModeDisableWithCob)) {
+        if (preferences.getBoostDosing(BooleanKey.ApsBoostNightModeDisableWithCob)) {
             val mealData = iobCobCalculator.getMealDataWithWaitingForCalculationFinish()
             if (mealData.mealCOB > 0) return false
         }
 
         // Disable night mode with low temp target
-        if (preferences.get(BooleanKey.ApsBoostNightModeDisableWithLowTt)) {
+        if (preferences.getBoostDosing(BooleanKey.ApsBoostNightModeDisableWithLowTt)) {
             val profile = profileFunction.getProfile() ?: return false
             val profileTarget = profile.getTargetMgdl()
             persistenceLayer.getTemporaryTargetActiveAt(dateUtil.now())?.let { tempTarget ->
@@ -1668,7 +2028,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
         // Check BG vs profile target + offset
         val profile = profileFunction.getProfile() ?: return false
         val profileTarget = profile.getTargetMgdl()
-        val bgOffset = profileUtil.convertToMgdl(preferences.get(UnitDoubleKey.ApsBoostNightModeBgOffset), profileUtil.units)
+        val bgOffset = profileUtil.convertToMgdl(preferences.getBoostDosing(UnitDoubleKey.ApsBoostNightModeBgOffset, profileUtil), profileUtil.units)
         return bgCurrent < profileTarget + bgOffset
     }
 
@@ -1726,8 +2086,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostBolus, dialogMessage = R.string.boost_bolus_summary, title = R.string.boost_bolus_title))
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostPercentScale, dialogMessage = R.string.boost_percent_scale_summary, title = R.string.boost_percent_scale_title))
             addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostScale, dialogMessage = R.string.boost_scale_summary, title = R.string.boost_scale_title))
-            addPreference(AdaptiveStringPreference(ctx = context, stringKey = StringKey.ApsBoostStartTime, dialogMessage = R.string.boost_start_summary, title = R.string.boost_start_title))
-            addPreference(AdaptiveStringPreference(ctx = context, stringKey = StringKey.ApsBoostEndTime, dialogMessage = R.string.boost_end_summary, title = R.string.boost_end_title))
+            // Boost start/end time retired 2026-07-02 — the Boost window now tracks the night-mode
+            // period (see calculateBoostActivity / isInNightSleepPeriod). Keys kept for back-compat.
             addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostEnablePercentScale, summary = R.string.boost_enable_percent_scale_summary, title = R.string.boost_enable_percent_scale_title))
         })
         addBoostEngineCategories(preferenceManager, category, context)
@@ -1908,3 +2268,31 @@ open class OpenAPSBoostPlugin @Inject constructor(
         }
     }
 }
+
+// ── V5/V6 exercise-input mapping (F2, 2026-07-07) ───────────────────────────────────────────────
+// Pure top-level helpers so the live profile build's mapping is unit-testable. They MUST stay
+// bit-identical to the retired V3MLG3 block (OpenAPSBoostV3MLG3Plugin.kt, `v5_exerciseActive =
+// activityResult.activityState in setOf(...)` / `v5_inPostExerciseWindow =
+// postExerciseRecoveryEnabled && now < recoveryWindowEnd`) — V5's consumers were calibrated
+// against that mapping while V5 shadowed V4.4.1.
+
+/**
+ * Activity states that count as "exercising" for V5/V6 ([OapsProfileBoost.v5_exerciseActive]).
+ * Consumed by MealSignalScore's notExercisingTerm and MealHypothesis' fastConfirm !exercising gate.
+ * NOTE: includes "STRESS" (as V3MLG3 did) — a high-HR no-steps state should damp meal confirmation
+ * just like exercise. Distinct from the plugin's post-exercise `exerciseStateSet`, which
+ * deliberately EXCLUDES "STRESS" (stress shouldn't start a recovery window).
+ */
+internal val V5_EXERCISE_STATES = setOf(
+    "ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE", "STRESS"
+)
+
+/** [OapsProfileBoost.v5_exerciseActive] from V1's activity classification. */
+internal fun v5ExerciseActive(activityState: String): Boolean = activityState in V5_EXERCISE_STATES
+
+/**
+ * [OapsProfileBoost.v5_inPostExerciseWindow] — true while the post-exercise recovery window is
+ * open. Feeds V5's AggressionBudget post-exercise damper (postExerciseRecoveryModifier).
+ */
+internal fun v5InPostExerciseWindow(postExerciseRecoveryEnabled: Boolean, nowMs: Long, recoveryWindowEndMs: Long): Boolean =
+    postExerciseRecoveryEnabled && nowMs < recoveryWindowEndMs

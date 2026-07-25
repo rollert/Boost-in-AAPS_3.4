@@ -152,6 +152,33 @@ class GarminPluginTest : TestBaseWithProfile() {
     }
 
     @Test
+    fun testOnPostHeartRates_batch() {
+        // /hr?device=venu3&samples=1000:72,1060:75,1120:255 → 3 (endMs, bpm) pairs (255 kept; the
+        // invalid-value filter is in LoopHubImpl, not the parser).
+        val uri = createUri(mapOf("device" to "venu3", "samples" to "1000:72,1060:75,1120:255"))
+        gp.onPostHeartRates(uri)
+        verify(loopHub).storeHeartRates(
+            listOf(Pair(1000_000L, 72), Pair(1060_000L, 75), Pair(1120_000L, 255)),
+            "venu3"
+        )
+    }
+
+    @Test
+    fun testOnPostHeartRates_testFlagStoresNothing() {
+        val uri = createUri(mapOf("device" to "venu3", "samples" to "1000:72", "test" to true))
+        gp.onPostHeartRates(uri)
+        verify(loopHub, org.mockito.kotlin.never()).storeHeartRates(org.mockito.kotlin.any(), org.mockito.kotlin.any())
+    }
+
+    @Test
+    fun testOnPostHeartRates_malformedSamplesSkipped() {
+        // garbage pairs are dropped, valid ones survive
+        val uri = createUri(mapOf("device" to "venu3", "samples" to "abc,1000:72,99:,:5"))
+        gp.onPostHeartRates(uri)
+        verify(loopHub).storeHeartRates(listOf(Pair(1000_000L, 72)), "venu3")
+    }
+
+    @Test
     fun testGetGlucoseValues_NoLast() {
         val from = getGlucoseValuesFrom
         val prev = createGlucoseValue(clock.instant().minusSeconds(310))

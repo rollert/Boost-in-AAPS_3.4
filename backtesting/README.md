@@ -95,6 +95,28 @@ Each writes a Markdown/PDF report next to the script and prints a summary.
 
 ---
 
+## Backtest protocol
+
+Standing protocol for every backtest of a dosing lever (adopted 2026-07; retro-applied to the
+2026-07 early-dosing series — see `reports/2026-07_early_dosing_series_REPORT.md`):
+
+1. **Source = TimescaleDB** (`oref`), **refreshed to t=now first** (`backfill_all.sh`, or a
+   targeted per-user `--since` extract) — never analyze a stale window silently.
+2. **Backtests are standalone local Python scripts**, committed under
+   `backtesting/scripts/<series>/` (sanitized: no URLs/tokens; raw pulls stay outside the repo).
+3. **Reports are committed under `backtesting/reports/`** with the **results contained** —
+   numbers in the markdown itself, not pointers to ephemeral scratchpads.
+4. **Decision bar — two tests:**
+   - **Test A (absolute gate, per user):** projected trailing-**14-day** TBR<70 + upper-bracket
+     ΔTBR ≤ 3.5% AND TBR<54 + Δ ≤ 0.8%; the **30-day** window is tracked as *trend only*
+     (window choice can flip a verdict). Levers adding insulin near nadir-<60 episodes get a
+     separate nadir-deepening review. Users over the absolutes get removal/neutral levers only.
+   - **Test B (efficiency ranking among A-passers):** moved insulin ≻ new insulin; new insulin
+     prices below the user's own base pre-low rate. Within-bracket-of-threshold calls
+     (ΔTBR bracket ≈ [0.15, 0.6]×ISF per pre-low unit) defer to live telemetry, not replay.
+
+---
+
 ## Privacy & data handling (read before adding sites)
 
 These tools touch real patients' Nightscout data. The rules, enforced by the scripts:
