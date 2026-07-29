@@ -300,6 +300,25 @@ open class OpenAPSBoostPlugin @Inject constructor(
     // Steps: boostSteps_feed transitions, reason-line only (no notification).
     @Volatile private var lastStepsFeed: String? = null
 
+    // Per-user ANTICIPATION shadow (2026-07-27): refits per-user exercise/meal onset-hazard models
+    // offline, predicts p(onset) at 45-min lead, runs the two retractable arms in shadow. READ-ONLY —
+    // logs anticip=...; delivers nothing. Onset history persists as a StringKey JSON blob (V7 idiom).
+    // See openAPSBoostTwin/ANTICIPATION_ARCHITECTURE_SPEC.md (Phase 1+2). Runs in the shared engine, so
+    // it covers plain Boost, V5/V6, and the V7-shadow line identically.
+    private val anticipShadow by lazy {
+        app.aaps.plugins.aps.openAPSBoostTwin.AnticipationShadow(
+            loadState = { preferences.get(StringKey.ApsBoostAnticipHistory) },
+            saveState = { preferences.put(StringKey.ApsBoostAnticipHistory, it) },
+            logError = { msg, t -> aapsLogger.error(LTag.APS, msg, t) },
+            weekMinuteOf = { ms ->
+                val z = java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault())
+                app.aaps.plugins.aps.openAPSBoostTwin.AnticipationHabitModel.weekMinute(
+                    z.dayOfWeek.value - 1, z.hour * 60 + z.minute
+                )
+            },
+        )
+    }
+
     // ---- Post-exercise recovery state ----
     @Volatile private var recoveryWindowEnd: Long = 0L
     @Volatile private var wasExerciseActive: Boolean = false
@@ -1457,9 +1476,15 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 // floored hold can out-dose V1 on the budget≈0 high tail (V1 doses ~0 there). Safe by
                 // construction: the exempt dose is committedCap + maxIOB bounded, the floor requires
                 // !postRescueWindow, and the cumulative-60min / boost-active / sleep gates all still run.
+                // 2026-07-20 V1-acceleration primer (bolus mode): the OBSERVING primer is already folded
+                // into finalDose and floored/netted in-engine, so exempt it from the non-meal v1-cap
+                // (it must out-dose V1's OBSERVING dose — that IS the reclaimed early insulin). The
+                // primer's own floors (recentLow≥80, !postRescue, awake, !exercise, maxIOB) ran in-engine;
+                // the cumulative-60min/sleep/boost-active seam guards above still apply.
                 val inMealState = v5decision.mealHypothesis == MealHypothesis.CONFIRMED ||
                     v5decision.mealHypothesis == MealHypothesis.COMMITTED ||
-                    v5decision.velocityBudgetExempt
+                    v5decision.velocityBudgetExempt ||
+                    (v5decision.primerBolusU > 0.0 && !v5decision.primerUseTempBasal)
                 // Post-rescue meal-state cap (2026-07-04): inside the post-rescue window the meal-state
                 // exemption is suppressed and CONFIRMED/COMMITTED are ALSO capped at V1's would-dose —
                 // which is hypo-restrained by V1's aligned tier guard (same value, same threshold; see
@@ -1492,6 +1517,42 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     it.reason.append("velocity-budget floor applied: ${Round.roundTo(v5decision.finalDose - vbUplift, 0.001)}→${Round.roundTo(v5decision.finalDose, 0.001)} U (base insulinReq≈0); ")
                     aapsLogger.info(LTag.APS, "V6 velocity-budget floor applied: ${Round.roundTo(v5decision.finalDose - vbUplift, 0.001)}→${Round.roundTo(v5decision.finalDose, 0.001)} U")
                 }
+                // ===== 2026-07-20 V1-acceleration early primer delivery + breadcrumb =====
+                if (v5decision.primerBolusU > 0.0) {
+                    if (v5decision.primerUseTempBasal) {
+                        // RETRACTABLE temp-basal fallback (hypo-prone routing): deliver ~primerBolusU over
+                        // a short window as a raise ABOVE scheduled basal — additive-only. NEVER fires when
+                        // the base engine is suspending/reducing (it.rate < current_basal): a protective
+                        // low/zero temp always wins. Never lowers what the base engine already planned
+                        // (max), and never shortens its duration. Expires (retracts) if the meal fades.
+                        val primerTbrDurationMin = 30
+                        val curBasal = oapsProfile.current_basal
+                        val baseRate = it.rate
+                        val extraRate = v5decision.primerBolusU * (60.0 / primerTbrDurationMin)
+                        val primerRate = curBasal + extraRate
+                        when {
+                            // Base engine suspending/reducing — a protective low/zero temp always wins.
+                            baseRate != null && baseRate < curBasal ->
+                                it.reason.append("primer=tbr-skipped(base-temp ${Round.roundTo(baseRate, 0.001)}<basal ${Round.roundTo(curBasal, 0.001)}); ")
+                            // Base engine already delivering ≥ the primer rate — primer adds nothing; do
+                            // NOT touch its rate/duration (extending a high base temp would over-deliver).
+                            baseRate != null && baseRate >= primerRate ->
+                                it.reason.append("primer=tbr-subsumed(base ${Round.roundTo(baseRate, 0.001)}≥primer ${Round.roundTo(primerRate, 0.001)}U/h); ")
+                            // Primer genuinely raises above the base plan → apply the retractable temp.
+                            else -> {
+                                it.rate = primerRate
+                                it.duration = kotlin.math.max(it.duration ?: 0, primerTbrDurationMin)
+                                it.reason.append("primer=tbr,${Round.roundTo(v5decision.primerBolusU, 0.001)}U→${Round.roundTo(primerRate, 0.001)}U/h×${it.duration}m; ")
+                                aapsLogger.info(LTag.APS, "V6 primer (temp-basal): ${v5decision.primerBolusU}U → ${primerRate}U/h x ${it.duration}min")
+                            }
+                        }
+                    } else {
+                        // Bolus mode: already folded into the SMB above (finalDose) + exempted from the
+                        // non-meal cap. Just log the reclaimed early insulin.
+                        it.reason.append("primer=bolus,${Round.roundTo(v5decision.primerBolusU, 0.001)}U; ")
+                        aapsLogger.info(LTag.APS, "V6 primer (bolus): ${v5decision.primerBolusU}U folded into SMB")
+                    }
+                }
             } else if (v5Active && v5decision != null && cumulativeCapReached) {
                 it.units = 0.0
                 it.reason.append("V6 suppressed (cumulative SMB cap ${Round.roundTo(recentSmbVolume60Min, 0.01)}U/${Round.roundTo(cumulativeSmbCap60Min, 0.01)}U reached); ")
@@ -1502,6 +1563,22 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 it.reason.append("V6 override skipped (Boost inactive) — base SMB ${Round.roundTo(it.units ?: 0.0, 0.001)}U; ")
                 aapsLogger.info(LTag.APS, "V6-ACTIVE override skipped — Boost inactive; base oref1 SMB ${it.units ?: 0.0}U retained")
             }
+
+            // Per-user ANTICIPATION shadow (2026-07-27) — READ-ONLY, delivers NOTHING. Records this
+            // cycle's exercise/meal onset, refits the per-user habit models offline, predicts p(onset)
+            // at a 45-min lead, and runs the two retractable arms in shadow. Appends anticip=... .
+            // Belt-and-braces on top of the shadow's own try/catch — can never break a cycle.
+            runCatching {
+                anticipShadow.runCycle(
+                    reason = it.reason,
+                    nowMs = now,
+                    steps5Min = recentSteps5Min,
+                    mealStateName = v5decision?.mealHypothesis?.name,
+                    bg = glucoseStatus.glucose,
+                    delta = glucoseStatus.delta,
+                    inPostRescueWindow = inPostRescueWindow,
+                )
+            }.onFailure { t -> aapsLogger.error(LTag.APS, "Anticipation shadow invocation failed (swallowed)", t) }
 
             // V6: surface the anticipatory pre-meal target decision computed earlier this cycle.
             v6PreMealReason?.let { r -> it.reason.append(r) }
