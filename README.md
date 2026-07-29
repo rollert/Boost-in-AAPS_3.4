@@ -7,13 +7,21 @@
 > decision. Do not run it on a pump unless you fully understand the code, accept the risk, and can
 > self-manage the consequences. You are the safety system.
 
+## Retained fork-specific AAPS changes
+
+- Pumps that cannot handle DST changes themselves use a one-hour loop suspension instead of the
+  upstream three-hour window.
+- DynISF/TDD in SMB and Boost V1/V2 uses an 80/10/10 blend: recent weighted 8h / 7d / 1d. The
+  low-usage protection path (`Weighted8H < 75% of 7d`) keeps its adjusted 7d value and applies the
+  same 80/10/10 weights: recent weighted 8h / adjusted 7d / 1d.
+
 ## What Boost V6 is
 
-Boost keeps the entire AndroidAPS engine — basal, dynamic ISF, glucose predictions and every
-safety gate — and changes only one thing: the super-micro-bolus (SMB) decision. Stock
-AndroidAPS sizes one isolated micro-bolus each cycle, from scratch. Boost V6 instead carries a
-*meal hypothesis* across cycles and scales its dosing to how confident it is that a meal is under
-way. Nothing else about how AndroidAPS runs your pump is touched.
+Boost keeps the AndroidAPS basal, dynamic ISF, glucose-prediction and safety-gate architecture.
+Boost V6 changes the super-micro-bolus (SMB) decision; the two retained fork-wide AAPS changes are
+documented above. Stock AndroidAPS sizes one isolated micro-bolus each cycle, from scratch. Boost
+V6 instead carries a *meal hypothesis* across cycles and scales its dosing to how confident it is
+that a meal is under way.
 
 The result is a system that holds back before a meal is proven, then catches up firmly once it is —
 and that you tune with just three dials (far fewer than before), most of which you never touch,

@@ -449,7 +449,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     // Recent insulin usage significantly below 7D average —
                     // pull the 7D average down toward recent reality before blending
                     val adjusted7D = tddWeightedFromLast8H + ((tddWeightedFromLast8H / tdd7D) * (tdd7D - tddWeightedFromLast8H))
-                    tdd = (adjusted7D * 0.34) + (tdd1D * 0.33) + (tddWeightedFromLast8H * 0.33)
+                    tdd = (tddWeightedFromLast8H * 0.80) + (adjusted7D * 0.10) + (tdd1D * 0.10)
                     debug.append("\nW8H < 75% of 7D → adjusted7D=${Round.roundTo(adjusted7D, 0.1)} (7D ${Round.roundTo(tdd7D, 0.1)} pulled toward W8H)")
                 } else {
                     // Standard blend: 80/10/10 weighting (more responsive to recent TDD)

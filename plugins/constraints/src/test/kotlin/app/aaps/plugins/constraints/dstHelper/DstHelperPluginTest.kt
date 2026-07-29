@@ -49,9 +49,9 @@ class DstHelperPluginTest : TestBaseWithProfile() {
         assertThat(plugin.willBeDST(cal)).isFalse()
         TimeZone.setDefault(tz)
         cal = Calendar.getInstance(tz, Locale.ITALIAN)
-        dateBeforeDST = df.parse("2018-03-25 05:55") //Cannot happen!!!
+        dateBeforeDST = df.parse("2018-03-25 05:55") // Outside the one-hour post-change window
         cal.time = dateBeforeDST!!
-        assertThat(plugin.wasDST(cal)).isTrue()
+        assertThat(plugin.wasDST(cal)).isFalse()
         assertThat(plugin.willBeDST(cal)).isFalse()
         TimeZone.setDefault(tz)
         cal = Calendar.getInstance(tz, Locale.ITALIAN)
