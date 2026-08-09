@@ -90,11 +90,14 @@ These are the only dials you would normally touch — and auto-config already se
 own dosing history, so most people leave them alone. Each scales *aggressiveness*; none can bypass
 a safety limit.
 
-| Lever | Range (default) | What it is | Turn it up → | Turn it down → |
-|---|---|---|---|---|
-| **Aggression** | 0.7–1.6 (1.0) | How firm the one meal catch-up shot is (it scales the CONFIRMED commit only — routine holds are bounded by the caps, not this). | a bigger catch-up shot on confirmed meals — for people who peak high | a gentler meal response |
-| **HypoCaution** | 1.0–2.0 (1.0) | How hard Boost backs off when its hypo-risk model is worried (it does nothing while risk is low). | more insulin trimmed on elevated risk = more hypo-defensive | 1.0 is the floor = least caution |
-| **Sensitivity** | 0.8–1.2 (1.0) | A single overall-strength dial for the whole engine — one number that scales *all* of Boost's dosing up or down. Despite the name it is NOT your insulin sensitivity / ISF (that lives in your profile); it's just "how much Boost, overall." Reach for it when Boost feels uniformly too strong or too weak for you. | firmer everywhere — if Boost runs too weak for you | gentler everywhere — if Boost runs too strong for you |
+| Setting (as named in the app) | Where | Range (default) | What it is | Turn it up → | Turn it down → |
+|---|---|---|---|---|---|
+| **Aggression** | Boost V6 | 0.7–1.6 (1.0) | How firm the one meal catch-up shot is (it scales the CONFIRMED commit only — routine holds are bounded by the caps, not this). | a bigger catch-up shot on confirmed meals — for people who peak high | a gentler meal response |
+| **Hypo Caution** | Boost V6 | 1.0–2.0 (1.0) | How hard Boost backs off when its hypo-risk model is worried (it does nothing while risk is low). | more insulin trimmed on elevated risk = more hypo-defensive | 1.0 is the floor = least caution |
+| **Meal-detection Sensitivity** | Boost V6 → Advanced Settings | 0.8–1.2 (1.0) | A single overall-strength dial for the whole engine — one number that scales *all* of Boost's dosing up or down. **The name is misleading in two ways:** it is not your insulin sensitivity / ISF (that lives in your profile), and despite "meal-detection" it does not change how meals are detected — it scales the per-cycle insulin (aggression) budget. Reach for it when Boost feels uniformly too strong or too weak for you. | firmer everywhere — if Boost runs too weak for you | gentler everywhere — if Boost runs too strong for you |
+
+The **Where** column gives the exact path in the app, and the names above are the exact labels you
+will see on those screens — so you can match documentation to settings without guessing.
 
 **How to use them:** start from the auto-config values, change one at a time, and check the
 caps and Max IOB first — if a cap or the IOB clamp is what's binding, more Aggression changes

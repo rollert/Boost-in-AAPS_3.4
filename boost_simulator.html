@@ -691,6 +691,15 @@ canvas {
         <input type="range" id="s-committedCap" min="0" max="2.5" step="0.05" value="0.5" oninput="update()">
         <div class="ctrl-hints"><span>0 U</span><span>2.5 U — per-cycle COMMITTED hold cap</span></div>
       </div>
+      <div class="ctrl">
+        <div class="ctrl-label"><span class="ctrl-name">Acceleration primer base</span><span class="ctrl-val" id="v-primerCapU">0.00 U</span></div>
+        <input type="range" id="s-primerCapU" min="0" max="1" step="0.05" value="0" oninput="update()">
+        <div class="ctrl-hints"><span>0 U (off)</span><span>1.0 U — ApsBoostV5PrimerCapU, auto-config derived</span></div>
+      </div>
+      <div class="toggle-row" style="margin-top:4px">
+        <span class="toggle-label">Primer already used this meal session</span>
+        <label class="toggle"><input type="checkbox" id="t-primerUsed" onchange="update()"><div class="toggle-slider"></div></label>
+      </div>
       <div class="toggle-row" style="margin-top:4px">
         <span class="toggle-label">Fast-carb confirm enabled (pref, default ON)</span>
         <label class="toggle"><input type="checkbox" id="t-fastCarbConfirm" checked onchange="update()"><div class="toggle-slider"></div></label>
@@ -1231,6 +1240,11 @@ const V6 = {
   // caps are the user prefs DoubleKey.ApsBoostV5ConfirmedCapU (default 2.5, 0–7.5) and
   // ApsBoostV5CommittedCapU (default 0.5, 0–2.5) — surfaced as sliders in this simulator.
   DEFAULT_CAP_CONFIRMED: 1.0, DEFAULT_CAP_COMMITTED: 0.25,
+  // 2026-07-20 V1-acceleration early primer (DetermineBasalBoostV5 PRIMER_* constants).
+  PRIMER_ACCEL_THRESHOLD: 10.0,      // delta acceleration above which the primer may fire
+  PRIMER_MIN_RECENT_LOW_MGDL: 80.0,  // no low below this in the recent window
+  PRIMER_MAX_MULT: 2.0,              // ceiling on the acceleration scaling, as a multiple of base
+  PRIMER_ACCEL_SCALE_DENOM: 20.0,    // scale = 1 + (accel - threshold) / this
   // ── SafetyGates.kt ──
   IOB_T0: 0.50, IOB_T1: 0.70, IOB_T2: 0.85,
   IOB_S1: 0.85, IOB_S2: 0.60, IOB_S3: 0.40,
@@ -1468,12 +1482,48 @@ function v6Decide(baseInsulinReq, m, prevState, knobs) {
   const capped = v6StateCap(st, velScaled, confirmedCap, committedCap);
   const stateCapped = capped < velScaled - 1e-9;
   const gated = v6Gates(capped, m);
+  // ===== 2026-07-20 V1-acceleration early primer =====
+  // Mirrors DetermineBasalBoostV5: computed once the state is known, applied AFTER the dose is
+  // finalised, and clamped to the remaining IOB headroom. Fires once per meal session, so the
+  // simulator exposes "already primed this session" rather than pretending to hold session state.
+  // The base is additive; the velocity-scaled excess above it is netted off the CONFIRMED
+  // commit-shot, which is why a primer here does not simply raise the total.
+  const primerCap = knobs.primerCapU || 0;
+  let primerBolusU = 0, primerReason = null;
+  if (primerCap <= 0) {
+    primerReason = 'off (cap 0)';
+  } else if (st !== 'OBSERVING') {
+    primerReason = `state ${st} (primer fires in OBSERVING only)`;
+  } else if (m.primerAlreadyApplied) {
+    primerReason = 'already primed this session';
+  } else if (!(m.deltaAccl > V6.PRIMER_ACCEL_THRESHOLD)) {
+    primerReason = `accel ${m.deltaAccl.toFixed(1)} ≤ ${V6.PRIMER_ACCEL_THRESHOLD}`;
+  } else if (!(m.delta > 0)) {
+    primerReason = 'delta not positive';
+  } else if (m.recentLowBg < V6.PRIMER_MIN_RECENT_LOW_MGDL) {
+    primerReason = `recent low ${Math.round(m.recentLowBg)} < ${V6.PRIMER_MIN_RECENT_LOW_MGDL}`;
+  } else if (m.asleep) {
+    primerReason = 'asleep';
+  } else if (m.exercising) {
+    primerReason = 'exercising';
+  } else if (m.recentLowBg < 75) {
+    primerReason = 'post-rescue window';
+  } else {
+    const scale = 1 + Math.max(0, (m.deltaAccl - V6.PRIMER_ACCEL_THRESHOLD) / V6.PRIMER_ACCEL_SCALE_DENOM);
+    const target = Math.min(primerCap * scale, V6.PRIMER_MAX_MULT * primerCap);
+    let amt = Math.min(target, Math.max(0, m.maxIob - m.iob - gated.dose));
+    if (m.roundSmbTo > 0) amt = Math.floor(amt / m.roundSmbTo + 1e-9) * m.roundSmbTo;
+    if (amt > 0) { primerBolusU = amt; primerReason = `scale ${scale.toFixed(2)}× base ${primerCap.toFixed(2)}U`; }
+    else primerReason = 'no IOB headroom left after the base dose';
+  }
+  const doseWithPrimer = Math.min(gated.dose + primerBolusU, Math.max(0, m.maxIob - m.iob));
   return {
+    primerBolusU, primerReason, doseBeforePrimer: gated.dose,
     state: st, prevState: prevState.state, score, scoreTerms: scoreRes.terms, renorm: scoreRes.renorm,
     budget: bud.budget, mlScale: bud.mlScale, postEx: bud.postEx, sens: bud.sens,
     actionMult, rawDose, velFactor, velScaled, capped, stateCapped, confirmedCap, committedCap,
     prospectiveShot, confirmFloor, confirmDoseAdequate,
-    finalDose: gated.dose, hard: gated.hard, gates: gated.gates,
+    finalDose: doseWithPrimer, hard: gated.hard, gates: gated.gates,
     spikeCapped: gated.spikeCapped, maxIobClamped: gated.maxIobClamped,
     eventualBgOffset: m.eventualBgOffset, newStateObj: newState,
   };
@@ -1558,6 +1608,7 @@ function v6Measurement(inp, r, opts) {
     mlHypoRisk: inp.mlHypoRisk,
     recentLowBg: inp.recentLowBg,
     fastCarbConfirmEnabled: inp.fastCarbConfirm,
+    primerAlreadyApplied: inp.primerUsed,
     hour: inp.circadian ? inp.circHour : new Date().getHours(),
     exercising: inp.activityState === 'active',
     inPostEx: inp.postExercise,
@@ -1575,6 +1626,7 @@ function v6Knobs(inp) {
   return {
     aggression: inp.v6Aggression, hypoCaution: inp.v6HypoCaution, sensitivity: inp.v6Sensitivity,
     confirmedCap: inp.confirmedCap, committedCap: inp.committedCap,
+    primerCapU: inp.primerCapU,
   };
 }
 
@@ -1942,6 +1994,8 @@ function getInputs() {
     confirmedCap:  gf('s-confirmedCap'),
     committedCap:  gf('s-committedCap'),
     fastCarbConfirm: gb('t-fastCarbConfirm'),
+    primerCapU:    gf('s-primerCapU'),
+    primerUsed:    gb('t-primerUsed'),
     mlMealLikely:  gf('s-mlMealLikely') / 100,
     mlHypoRisk:    gf('s-mlHypoRisk') / 100,
     noMl:          gb('t-noMl'),
@@ -1975,6 +2029,7 @@ function update() {
   sl('lastCarbAge',' min'); sl('cr',' g/U');
   sl('recentLowBg',' mg/dL'); sl('cumSmbCap',' U');
   sl('confirmedCap',' U'); sl('committedCap',' U');
+  sl('primerCapU',' U');
   sl('percentScale','%');
   sl('activityPct','%'); sl('inactivityPct','%');
   sl('nightOffset',' mg/dL'); sl('cob',' g');
@@ -2322,6 +2377,11 @@ function renderV6Tab(inp, r) {
   bd += `budget = max(${V6.BUDGET_FLOOR}×base, base × mlHypo ${fmt(v6.mlScale,2)} × postEx ${fmt(v6.postEx,2)} × sens ${fmt(v6.sens,2)}) = ${fmt(v6.budget,3)} U\n`;
   bd += `dose = budget × multiplier(${v6.state}) ${fmt(v6.actionMult,2)} = ${fmt(v6.rawDose,3)} U\n`;
   bd += `× velocity ${fmt(v6.velFactor,2)} (cumRise30 ${fmt(m.cumRise30,0)}) = ${fmt(v6.velScaled,3)} U → state-cap ${fmt(v6.capped,3)} U${v6.stateCapped ? ` (${v6.state} cap ${fmt(v6.state==='CONFIRMED'?inp.confirmedCap:inp.committedCap,2)}U bound)` : ''}\n`;
+  // The primer is applied after the dose is finalised, so it is reported after the cap line
+  // rather than folded into it, exactly as the engine applies it.
+  bd += v6.primerBolusU > 0
+    ? `+ acceleration primer ${fmt(v6.primerBolusU,3)} U (${v6.primerReason}) = ${fmt(v6.finalDose,3)} U; base is additive, any excess is netted off the commit-shot\n`
+    : `acceleration primer: none — ${v6.primerReason}\n`;
   if (v6.hard) bd += `HARD GATE: ${v6.hard} → 0 U\n`;
   else bd += `gates: ${v6.gates.length ? v6.gates.join(', ') : 'none'} → engine dose ${fmt(v6.finalDose,2)} U${v6.spikeCapped ? ' (spike-capped)' : ''}\n`;
   if (ov.mode === 'sleep' || ov.mode === 'boost-inactive' || ov.mode === 'cum-cap') bd += `override site: ${ov.note}`;
@@ -2677,7 +2737,7 @@ const DEFAULTS = {
   cob:0, lastCarbAge:60, cr:10, recentLowBg:120, cumSmbCap:10, nightModeCob:false,
   tempTarget:false, tempTargetBg:140, highTtSens:false, lowTtSens:false,
   v6Aggression:1.0, v6HypoCaution:1.0, v6Sensitivity:1.0,
-  confirmedCap:2.5, committedCap:0.5, fastCarbConfirm:true,
+  confirmedCap:2.5, committedCap:0.5, fastCarbConfirm:true, primerCapU:0, primerUsed:false,
   mlMealLikely:0, mlHypoRisk:0, noMl:false, mlNull3:false, v6PriorState:'IDLE', postExercise:false,
 };
 const scenarios = {
