@@ -13,7 +13,7 @@ import kotlin.math.min
  *
  * V3 differences from V1:
  *   1. TDD uses 7-day average only (no blended W8H/1D/7D)
- *   2. Safety check retained: if W8H < 20% of 7D (>80% below the 7-day average),
+ *   2. Safety check retained: if W8H < 15% of 7D (>85% below the 7-day average),
  *      TDD is pulled down toward W8H
  *   3. Velocity is always 1.0 — no BG Impact dampening
  *   4. variableSens = sensNormalTarget × scaler (no velocity term)
@@ -35,8 +35,8 @@ class BoostV3IsfCalculationTest {
         adjustFactor: Double = 100.0
     ): Double {
         val w8h = (1.4 * tddLast4H + 0.6 * tddLast8to4H) * 3
-        val tdd = if (w8h < 0.20 * tdd7D) {
-            // Pull 7D toward recent reality (only when >80% below 7D)
+        val tdd = if (w8h < 0.15 * tdd7D) {
+            // Pull 7D toward recent reality (only when >85% below 7D)
             w8h + (w8h / tdd7D) * (tdd7D - w8h)
         } else {
             tdd7D
@@ -46,7 +46,7 @@ class BoostV3IsfCalculationTest {
 
     /**
      * Computes the blended TDD that V1 uses: 80/10/10 weighting with the
-     * W8H < 20%-of-7D pull-down (mirrors OpenAPSBoostPlugin).
+     * W8H < 15%-of-7D pull-down (mirrors OpenAPSBoostPlugin).
      */
     private fun computeV1BlendedTdd(
         tdd7D: Double,
@@ -56,7 +56,7 @@ class BoostV3IsfCalculationTest {
         adjustFactor: Double = 100.0
     ): Double {
         val w8h = (1.4 * tddLast4H + 0.6 * tddLast8to4H) * 3
-        val tdd = if (w8h < 0.20 * tdd7D) {
+        val tdd = if (w8h < 0.15 * tdd7D) {
             val adjusted7D = w8h + (w8h / tdd7D) * (tdd7D - w8h)
             (w8h * 0.80) + (adjusted7D * 0.10) + (tdd1D * 0.10)
         } else {
@@ -109,18 +109,18 @@ class BoostV3IsfCalculationTest {
     inner class TddCalculation {
 
         @Test
-        @DisplayName("V3 uses 7D TDD when W8H >= 20% of 7D")
+        @DisplayName("V3 uses 7D TDD when W8H >= 15% of 7D")
         fun `v3 uses 7D when recent insulin is normal`() {
             val tdd = computeV3Tdd(tdd7D = 43.0, tddLast4H = 6.0, tddLast8to4H = 5.0, adjustFactor = 100.0)
-            // W8H = (1.4×6 + 0.6×5)×3 = (8.4+3.0)×3 = 34.2 → 34.2 >= 0.20×43 = 8.6 ✓
+            // W8H = (1.4×6 + 0.6×5)×3 = (8.4+3.0)×3 = 34.2 → 34.2 >= 0.15×43 = 6.45 ✓
             assertThat(tdd).isEqualTo(43.0)
         }
 
         @Test
-        @DisplayName("V3 pulls 7D down when W8H < 20% of 7D (>80% below 7D)")
+        @DisplayName("V3 pulls 7D down when W8H < 15% of 7D (>85% below 7D)")
         fun `v3 reduces TDD when recent usage is low`() {
             val tdd = computeV3Tdd(tdd7D = 43.0, tddLast4H = 0.5, tddLast8to4H = 0.5, adjustFactor = 100.0)
-            // W8H = (1.4×0.5 + 0.6×0.5)×3 = 3.0 → 3.0 < 0.20×43 = 8.6
+            // W8H = (1.4×0.5 + 0.6×0.5)×3 = 3.0 → 3.0 < 0.15×43 = 6.45
             // adjusted = 3.0 + (3.0/43)×(43-3) = 3.0 + 2.79 = 5.79
             assertThat(tdd).isWithin(0.1).of(5.79)
         }
@@ -148,8 +148,8 @@ class BoostV3IsfCalculationTest {
             // Same 7D average, different 4H activity
             val tddQuiet = computeV3Tdd(tdd7D = 43.0, tddLast4H = 0.5, tddLast8to4H = 0.5, adjustFactor = 100.0)
             val tddActive = computeV3Tdd(tdd7D = 43.0, tddLast4H = 15.0, tddLast8to4H = 10.0, adjustFactor = 100.0)
-            // Active: W8H = (1.4×15+0.6×10)×3 = 81 >= 0.20×43 = 8.6 → 7D unchanged
-            // Quiet: W8H = (1.4×0.5+0.6×0.5)×3 = 3.0 < 8.6 → adjusted down
+            // Active: W8H = (1.4×15+0.6×10)×3 = 81 >= 0.15×43 = 6.45 → 7D unchanged
+            // Quiet: W8H = (1.4×0.5+0.6×0.5)×3 = 3.0 < 6.45 → adjusted down
             assertThat(tddActive).isEqualTo(43.0)
             assertThat(tddQuiet).isLessThan(43.0) // adjusted down due to low recent
         }
@@ -277,10 +277,10 @@ class BoostV3IsfCalculationTest {
         @Test
         @DisplayName("Overnight collapse: both reduce TDD, V1 more than V3")
         fun `overnight collapse reduces tdd in both`() {
-            // Overnight collapse: recent usage >80% below 7D (W8H < 20% of 7D)
-            val tddV3 = computeV3Tdd(tdd7D = 20.0, tddLast4H = 0.5, tddLast8to4H = 0.5, adjustFactor = 90.0)
-            val tddV1 = computeV1BlendedTdd(tdd7D = 20.0, tdd1D = 5.0, tddLast4H = 0.5, tddLast8to4H = 0.5, adjustFactor = 90.0)
-            // W8H = 3.0 < 0.20×20 = 4.0 → both apply the safety reduction
+            // Overnight collapse: recent usage >85% below 7D (W8H < 15% of 7D)
+            val tddV3 = computeV3Tdd(tdd7D = 20.0, tddLast4H = 0.4, tddLast8to4H = 0.4, adjustFactor = 90.0)
+            val tddV1 = computeV1BlendedTdd(tdd7D = 20.0, tdd1D = 5.0, tddLast4H = 0.4, tddLast8to4H = 0.4, adjustFactor = 90.0)
+            // W8H = 2.4 < 0.15×20 = 3.0 → both apply the safety reduction
             assertThat(tddV3).isLessThan(20.0 * 0.9) // adjusted down
             assertThat(tddV1).isLessThan(20.0 * 0.9) // also adjusted
             // V1 leans 80% on the collapsed W8H, so it lands below V3's adjusted 7D

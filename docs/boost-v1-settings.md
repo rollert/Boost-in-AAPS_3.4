@@ -317,10 +317,10 @@ V3 eliminates this feedback loop by using the **7-day average only**:
 TDD_v3 = 7D_average × adjustment_factor
 ```
 
-The safety check is retained: when the weighted 8-hour TDD falls below 20% of the 7-day average (indicating a collapse of insulin delivery by more than 80%, e.g. pump suspension, illness or missed boluses), the 7-day value is pulled down toward recent reality to avoid overdosing:
+The safety check is retained: when the weighted 8-hour TDD falls below 15% of the 7-day average (indicating a collapse of insulin delivery by more than 85%, e.g. pump suspension, illness or missed boluses), the 7-day value is pulled down toward recent reality to avoid overdosing:
 
 ```
-if WeightedLast8H < 0.20 × 7D:
+if WeightedLast8H < 0.15 × 7D:
     TDD = WeightedLast8H + (WeightedLast8H / 7D) × (7D − WeightedLast8H)
 ```
 

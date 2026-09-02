@@ -312,12 +312,12 @@ open class OpenAPSBoostV2Plugin @Inject constructor(
                 val tddWeightedFromLast8H = ((1.4 * tddLast4H) + (0.6 * tddLast8to4H)) * 3
                 debug.append("\nWeighted8H=${Round.roundTo(tddWeightedFromLast8H, 0.1)} (4H×1.4 + 8-4H×0.6)×3")
 
-                if (tddWeightedFromLast8H < (0.20 * tdd7D)) {
-                    // Recent insulin usage critically below 7D average (>80% reduction) —
+                if (tddWeightedFromLast8H < (0.15 * tdd7D)) {
+                    // Recent insulin usage critically below 7D average (>85% reduction) —
                     // pull the 7D average down toward recent reality before blending
                     val adjusted7D = tddWeightedFromLast8H + ((tddWeightedFromLast8H / tdd7D) * (tdd7D - tddWeightedFromLast8H))
                     tdd = (tddWeightedFromLast8H * 0.80) + (adjusted7D * 0.10) + (tdd1D * 0.10)
-                    debug.append("\nW8H < 20% of 7D → adjusted7D=${Round.roundTo(adjusted7D, 0.1)} (7D ${Round.roundTo(tdd7D, 0.1)} pulled toward W8H)")
+                    debug.append("\nW8H < 15% of 7D → adjusted7D=${Round.roundTo(adjusted7D, 0.1)} (7D ${Round.roundTo(tdd7D, 0.1)} pulled toward W8H)")
                 } else {
                     // Standard blend: 80/10/10 weighting (more responsive to recent TDD)
                     tdd = (tddWeightedFromLast8H * 0.80) + (tdd7D * 0.10) + (tdd1D * 0.10)
