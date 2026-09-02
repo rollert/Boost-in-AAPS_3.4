@@ -12,8 +12,9 @@
 - Pumps that cannot handle DST changes themselves use a one-hour loop suspension instead of the
   upstream three-hour window.
 - DynISF/TDD in SMB and Boost V1/V2 uses an 80/10/10 blend: recent weighted 8h / 7d / 1d. The
-  low-usage protection path (`Weighted8H < 75% of 7d`) keeps its adjusted 7d value and applies the
-  same 80/10/10 weights: recent weighted 8h / adjusted 7d / 1d.
+  low-usage protection path (`Weighted8H < 20% of 7d`, i.e. delivery >80% below the 7-day average)
+  keeps its adjusted 7d value and applies the same 80/10/10 weights: recent weighted 8h /
+  adjusted 7d / 1d.
 
 ## What Boost V6 is
 

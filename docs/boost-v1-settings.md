@@ -303,10 +303,10 @@ Boost V3 uses the same ISF formula as V1 (`1800 / (TDD × ln(BG / insulinDivisor
 
 ### TDD: 7-day average only
 
-V1 and V2 compute a blended TDD from three sources weighted equally:
+V1 and V2 compute a blended TDD weighted toward recent delivery:
 
 ```
-TDD_blended = (WeightedLast8H × 0.33) + (7D_average × 0.34) + (1D_average × 0.33)
+TDD_blended = (WeightedLast8H × 0.80) + (7D_average × 0.10) + (1D_average × 0.10)
 ```
 
 The `WeightedLast8H` component is `(1.4 × last4H + 0.6 × last8-4H) × 3`, which extrapolates recent insulin delivery to a daily rate. During a rollercoaster day — repeated spikes treated with large SMBs — this 4-hour window inflates the blended TDD far above the 7-day average. A higher TDD produces a lower ISF, making the algorithm more aggressive, which stacks more insulin, which crashes BG further, which requires rescue carbs, which starts the next spike.
@@ -317,10 +317,10 @@ V3 eliminates this feedback loop by using the **7-day average only**:
 TDD_v3 = 7D_average × adjustment_factor
 ```
 
-The safety check is retained: when the weighted 8-hour TDD falls below 75% of the 7-day average (indicating significantly reduced insulin delivery, e.g. overnight or during fasting), the 7-day value is pulled down toward recent reality to avoid overdosing:
+The safety check is retained: when the weighted 8-hour TDD falls below 20% of the 7-day average (indicating a collapse of insulin delivery by more than 80%, e.g. pump suspension, illness or missed boluses), the 7-day value is pulled down toward recent reality to avoid overdosing:
 
 ```
-if WeightedLast8H < 0.75 × 7D:
+if WeightedLast8H < 0.20 × 7D:
     TDD = WeightedLast8H + (WeightedLast8H / 7D) × (7D − WeightedLast8H)
 ```
 
