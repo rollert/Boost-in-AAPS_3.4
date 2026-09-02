@@ -463,12 +463,12 @@ open class OpenAPSBoostV3MLPlugin @Inject constructor(
                 val tddWeightedFromLast8H = ((1.4 * tddLast4H) + (0.6 * tddLast8to4H)) * 3
                 debug.append("\nWeighted8H=${Round.roundTo(tddWeightedFromLast8H, 0.1)} (4H×1.4 + 8-4H×0.6)×3")
 
-                if (tddWeightedFromLast8H < (0.75 * tdd7D)) {
-                    // Recent insulin usage significantly below 7D average —
+                if (tddWeightedFromLast8H < (0.20 * tdd7D)) {
+                    // Recent insulin usage critically below 7D average (>80% reduction) —
                     // pull the 7D average down toward recent reality
                     val adjusted7D = tddWeightedFromLast8H + ((tddWeightedFromLast8H / tdd7D) * (tdd7D - tddWeightedFromLast8H))
                     tdd = adjusted7D
-                    debug.append("\nW8H < 75% of 7D → adjusted7D=${Round.roundTo(adjusted7D, 0.1)} (7D ${Round.roundTo(tdd7D, 0.1)} pulled toward W8H)")
+                    debug.append("\nW8H < 20% of 7D → adjusted7D=${Round.roundTo(adjusted7D, 0.1)} (7D ${Round.roundTo(tdd7D, 0.1)} pulled toward W8H)")
                 } else {
                     // V3: use 7-day TDD only (no short-term blend)
                     tdd = tdd7D
