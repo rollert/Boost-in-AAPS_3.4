@@ -111,15 +111,40 @@ import app.aaps.plugins.aps.openAPSBoostV5.MealHypothesis
 private const val DYNISF_MIN_TDD_FRACTION = 0.35
 
 /**
- * True when [tdd] is too low to be believed given what [profileSens] implies, so dynamic ISF must NOT
- * be derived from it. Extracted as a pure function so the guard is unit-testable independently of the
- * plugin's DI graph. Returns false when [profileSens] is non-positive (no reference to judge against —
- * fail OPEN there, because the existing `tdd > 0` check still applies downstream).
+ * 2026-09-02 NEAR-ZERO FLOOR (variant C, second leg). A blended TDD below this fraction of the
+ * implied TDD is treated as degenerate even when the 7-day average is healthy — e.g. the pump
+ * offline for most of the window, extrapolation collapsed to noise. Deliberately set to 0.15 so
+ * it only catches genuine near-zero delivery, never the fast-sensitivity range: a 7D=40 /
+ * profile-ISF=45 user with W8H=8 blends to TDD 11.2 (28% of implied) and passes.
  */
-internal fun tddImplausibleForProfile(tdd: Double, profileSens: Double): Boolean {
+private const val DYNISF_NEAR_ZERO_TDD_FRACTION = 0.15
+
+/**
+ * True when dynamic ISF must NOT be derived from [tdd], given what [profileSens] implies.
+ * Extracted as a pure function so the guard is unit-testable independently of the plugin's DI
+ * graph. Returns false when [profileSens] is non-positive (no reference to judge against —
+ * fail OPEN there, because the existing `tdd > 0` check still applies downstream).
+ *
+ * 2026-09-02 7D-ANCHORED GUARD (variant C). Two independent legs:
+ *
+ *  ① CORRUPTION — anchored on [tdd7D], NOT on the blend. Data corruption (fresh DB, migration)
+ *     destroys every TDD window simultaneously; physiology only depresses the recent ones. If
+ *     even the 7-day average is far below what the profile implies, history as a whole is
+ *     suspect → fall back. A healthy 7D with a small blend is REAL physiology and is trusted —
+ *     the previous blend-anchored check discarded legitimate fast-sensitivity drops
+ *     (7D=40, W8H=8 → blend 11.2 < 14 → profile ISF exactly when DynISF mattered most).
+ *
+ *  ② NEAR-ZERO — anchored on the blended [tdd]. With a healthy 7D the blend can still be
+ *     degenerate because records are MISSING rather than wrong (pump offline, sync gap).
+ *     Below this floor a derived ISF is noise.
+ */
+internal fun tddImplausibleForProfile(tdd7D: Double, tdd: Double, profileSens: Double): Boolean {
     if (profileSens <= 0.0) return false
     val impliedTdd = 1800.0 / profileSens
-    return tdd < impliedTdd * DYNISF_MIN_TDD_FRACTION
+    // ① corruption: the 7-day history as a whole vs what the profile implies
+    // ② near-zero: blended delivery collapsed even though the 7D is healthy
+    return tdd7D < (impliedTdd * DYNISF_MIN_TDD_FRACTION) ||
+        tdd < (impliedTdd * DYNISF_NEAR_ZERO_TDD_FRACTION)
 }
 
 // @Singleton MUST stay adjacent to this declaration. 2026-07-30..08-04: a KDoc, a constant and a
@@ -545,21 +570,39 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 // profile. Falling back is SAFE-SIGNED — profileSens is the value the user/clinician
                 // configured, so a false positive costs dynamic responsiveness for that cycle and
                 // nothing else, which is why the fraction is set liberally rather than tightly.
+                //
+                // 2026-09-02 7D-ANCHORED GUARD (variant C). The original check anchored on the
+                // BLENDED tdd, which discarded legitimate fast-sensitivity drops: with 80/10/10,
+                // a 7D=40 / W8H=8 day blends to TDD 11.2 — 28% of the implied 40 — and was sent
+                // to profile ISF exactly when dynamic ISF mattered most. Corruption and
+                // physiology are separable: corruption (fresh DB, migration) destroys every TDD
+                // window at once, physiology only the recent ones. The guard now fires on
+                // ① tdd7D < 0.35 × implied (history as a whole suspect) OR ② blended tdd <
+                // 0.15 × implied (near-zero delivery window, e.g. pump offline). A healthy 7D
+                // with a small blend is real and is trusted.
                 val impliedTdd = if (profileSens > 0) 1800.0 / profileSens else 0.0
-                val tddImplausible = tddImplausibleForProfile(tdd, profileSens)
+                val tddImplausible = tddImplausibleForProfile(tdd7D, tdd, profileSens)
                 if (tddImplausible) {
                     // Leave sensNormalTarget at profileSens (its initial value) — do NOT derive.
+                    // Two legs (2026-09-02, variant C): ① 7-day TDD implausible vs the profile →
+                    // history as a whole is suspect (corruption). ② blended TDD near-zero with a
+                    // healthy 7D → delivery collapsed to noise in this window.
+                    val corruptionLeg = tdd7D < impliedTdd * DYNISF_MIN_TDD_FRACTION
+                    val floorFraction = if (corruptionLeg) DYNISF_MIN_TDD_FRACTION else DYNISF_NEAR_ZERO_TDD_FRACTION
+                    val observedTdd = if (corruptionLeg) tdd7D else tdd
+                    val legName = if (corruptionLeg) "7-day TDD" else "blended TDD"
+                    val historyState = if (corruptionLeg) "incomplete" else "degenerate in the recent window"
                     debug.append(
-                        "\n⚠ dynISF=PROFILE-FALLBACK: TDD ${Round.roundTo(tdd, 0.1)} U/day is below " +
-                            "${Round.roundTo(impliedTdd * DYNISF_MIN_TDD_FRACTION, 0.1)} " +
-                            "(${(DYNISF_MIN_TDD_FRACTION * 100).toInt()}% of the ${Round.roundTo(impliedTdd, 0.1)} " +
+                        "\n⚠ dynISF=PROFILE-FALLBACK: $legName ${Round.roundTo(observedTdd, 0.1)} U/day is below " +
+                            "${Round.roundTo(impliedTdd * floorFraction, 0.1)} " +
+                            "(${(floorFraction * 100).toInt()}% of the ${Round.roundTo(impliedTdd, 0.1)} " +
                             "implied by profile ISF ${Round.roundTo(profileSens, 0.1)}) — insulin history looks " +
-                            "incomplete; using profile ISF instead of a derived one this cycle"
+                            "$historyState; using profile ISF instead of a derived one this cycle"
                     )
                     aapsLogger.info(
                         LTag.APS,
-                        "Boost dynISF profile-fallback: tdd=${Round.roundTo(tdd, 0.1)} < " +
-                            "${Round.roundTo(impliedTdd * DYNISF_MIN_TDD_FRACTION, 0.1)} implied-floor; using profileSens=$profileSens"
+                        "Boost dynISF profile-fallback: ${legName.lowercase()}=${Round.roundTo(observedTdd, 0.1)} < " +
+                            "${Round.roundTo(impliedTdd * floorFraction, 0.1)} implied-floor; using profileSens=$profileSens"
                     )
                 }
                 if (tdd > 0 && logTerm > 0 && !tddImplausible) {
