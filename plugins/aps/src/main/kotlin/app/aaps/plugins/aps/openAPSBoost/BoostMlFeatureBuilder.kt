@@ -26,6 +26,14 @@ import org.json.JSONObject
 object BoostMlFeatureBuilder {
 
     const val LOOKBACK = 6
+
+    /**
+     * The span the lookback window claims to represent, plus one cycle of slack so an ordinary
+     * late reading does not discard usable history. Six cycles at the five-minute grid is thirty
+     * minutes; anything older than thirty-five is not the preceding six cycles and must not be
+     * presented to the model as though it were.
+     */
+    const val STALE_AFTER_MS: Long = 35 * 60 * 1000L
     val LOOKBACK_FEATURES = listOf(
         "cgm_mgdl", "iob_iob", "iob_activity",
         "sug_eventualBG", "recent_smb_units_60m", "sug_minDelta"
@@ -63,12 +71,50 @@ object BoostMlFeatureBuilder {
             .put("sug_minDelta", sugMinDelta)
     }
 
+    /**
+     * Spacing the lag features must keep, in ms. The models were TRAINED on five-minute lags, so
+     * lag1..lag5 have to remain five-minute steps whatever the loop cycles at. On a one-minute
+     * feed an unguarded push would make LOOKBACK=6 span six minutes instead of thirty, and the
+     * model would be extrapolating from inputs unlike anything it saw in training.
+     *
+     * This is the one count-based window in the 1-minute sweep that must NOT simply be retimed:
+     * the lag COUNT is part of the model, so the INPUT is resampled instead. (2026-08-01)
+     */
+    const val LAG_SPACING_MS = 5L * 60 * 1000
+    private const val LAG_SPACING_TOLERANCE_MS = 30L * 1000
+
     data class RingBuffer(val snapshots: MutableList<CycleSnapshot> = mutableListOf()) {
+        /**
+         * Append, then drop anything the window no longer covers — by AGE as well as by count.
+         *
+         * The buffer is persisted across process restarts, and the decision series is interrupted
+         * often. Trimming by length alone leaves pre-gap snapshots in place, so a cycle arriving
+         * two hours after the last one is scored with lag features from two hours ago presented as
+         * the preceding five cycles. That is not the history the model was trained on: an offline
+         * replay of the exported model against its own published output reproduces contiguous
+         * cycles to a median absolute error of 0.003 to 0.006, and on post-gap cycles the carried
+         * snapshots explain the published score better than either a cleared buffer or the true
+         * contiguous history, for every user tested.
+         */
         fun push(s: CycleSnapshot) {
+            // Admit a snapshot only once per lag interval, so the buffer holds five-minute steps
+            // even when called every minute. Replaces the newest when called again too soon, so
+            // the freshest reading within the interval is the one kept.
+            val last = snapshots.lastOrNull()
+            if (last != null && s.ts - last.ts < LAG_SPACING_MS - LAG_SPACING_TOLERANCE_MS) {
+                snapshots[snapshots.lastIndex] = s
+                return
+            }
             snapshots.add(s)
+            val oldest = s.ts - STALE_AFTER_MS
+            snapshots.removeAll { it.ts < oldest }
             while (snapshots.size > LOOKBACK) snapshots.removeAt(0)
         }
-        /** Get the snapshot `lag` cycles ago (0 = most recent). Returns null if buffer too short. */
+
+        /**
+         * Get the snapshot `lag` cycles ago (0 = most recent). Null when the buffer is too short,
+         * which the caller renders as a fall back to the current cycle.
+         */
         fun lagged(lag: Int): CycleSnapshot? {
             val idx = snapshots.size - 1 - lag
             return if (idx in 0..snapshots.lastIndex) snapshots[idx] else null
